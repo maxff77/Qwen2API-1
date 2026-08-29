@@ -102,9 +102,12 @@ const getProxyAgent = (account) => {
  */
 const invalidateProxyAgent = (url) => {
     if (!url) return
-    // Delete all entries matching this proxy URL (any account)
+    // Delete all entries matching this proxy URL exactly (any account).
+    // Cache keys are `${proxyUrl}::${email}`; match only when the URL segment
+    // before '::' equals the target url to avoid prefix collisions (e.g. port 8080 vs 80800).
     for (const [key, agent] of proxyAgents.entries()) {
-        if (key.startsWith(`${url}::`)) {
+        const sepIdx = key.lastIndexOf('::')
+        if (sepIdx !== -1 && key.slice(0, sepIdx) === url) {
             try {
                 if (typeof agent.destroy === 'function') agent.destroy()
             } catch (_) {}

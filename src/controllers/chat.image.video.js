@@ -15,32 +15,6 @@ const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
 
 /**
- * 构造与当前账号一致的上游 Cookie 头
- * @param {string} token - 当前账号令牌
- * @returns {string} Cookie 头
- */
-const buildUpstreamCookieHeader = (token, account) => {
-    const cookieParts = []
-
-    if (token) {
-        cookieParts.push(`token=${token}`)
-    }
-
-    // Per-account SSXMOD when account context available; global fallback otherwise
-    const ssxmod = getSsxmodForAccount(account)
-
-    if (ssxmod.ssxmod_itna) {
-        cookieParts.push(`ssxmod_itna=${ssxmod.ssxmod_itna}`)
-    }
-
-    if (ssxmod.ssxmod_itna2) {
-        cookieParts.push(`ssxmod_itna2=${ssxmod.ssxmod_itna2}`)
-    }
-
-    return cookieParts.join('; ')
-}
-
-/**
  * 将上游响应体格式化为便于日志输出的对象
  * @param {*} payload - 原始响应体
  * @returns {*} 可序列化的日志对象

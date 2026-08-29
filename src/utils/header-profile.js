@@ -136,7 +136,7 @@ function buildRequestHeaders(account, options = {}) {
 
     const headers = {
         'sec-ch-ua-platform': secChPlatform,
-        'accept-language': `${language},${language.split('-')[0]};q=0.9`,
+        'accept-language': language.includes('-') ? `${language},${language.split('-')[0]};q=0.9` : language,
         'sec-ch-ua': secChUa,
         'sec-ch-ua-mobile': '?0',
         'user-agent': ua,
