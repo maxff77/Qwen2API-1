@@ -2,10 +2,11 @@ const axios = require('axios')
 const accountManager = require('./account.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger')
-const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
+const { getSsxmodForAccount } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
-const { generateUUID, getTimezoneHeader } = require('./tools.js')
+const { generateUUID, getTimezoneHeader, jitter } = require('./tools.js')
 const { uploadAgentContextFile } = require('./upload.js')
+const { buildRequestHeaders } = require('./header-profile')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
 const RETRYABLE_ERROR_CODES = new Set([
@@ -354,33 +355,23 @@ const sendChatRequest = async (body, options = {}) => {
     const chatBaseUrl = getChatBaseUrl()
     const proxyAgent = getProxyAgent(currentAccount)
 
+    // Antidetect: per-account fingerprint headers replace static block
+    const ssxmod = getSsxmodForAccount(currentAccount)
+    const headers = buildRequestHeaders(currentAccount, {
+        chatBaseUrl,
+        token: currentToken,
+        ssxmodItna: ssxmod.ssxmod_itna,
+        ssxmodItna2: ssxmod.ssxmod_itna2,
+        accept: 'application/json',
+        extra: {
+            'x-request-id': generateUUID(),
+            'x-accel-buffering': 'no'
+        }
+    })
+
     // 构建请求配置（与通义千问 React Web 客户端完全一致，对齐 FE 0.2.81）
     const requestConfig = {
-        headers: {
-            'sec-ch-ua-platform': '"Windows"',
-            'referer': `${chatBaseUrl}/`,
-            'accept-language': 'zh-CN,zh;q=0.9',
-            'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-            'sec-ch-ua-mobile': '?0',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-            'content-type': 'application/json',
-            'accept': 'application/json',
-            'accept-encoding': 'gzip, deflate, br, zstd',
-            // WAF 客户端标识头（必须与 React Web 客户端一致）
-            'source': 'web',
-            'version': '0.2.81',
-            'timezone': getTimezoneHeader(),
-            'x-request-id': generateUUID(),
-            'connection': 'keep-alive',
-            // Cookie: JWT token + SSXMOD 反爬链（双重认证；浏览器不带 authorization 头，鉴权全走 cookie）
-            'cookie': `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
-            'host': chatBaseUrl.replace('https://', ''),
-            'origin': chatBaseUrl,
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin',
-            'x-accel-buffering': 'no',
-        },
+        headers,
         responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
         timeout: 10 * 60 * 1000, // Max/thinking models may exceed 60s before answer
     }
@@ -472,7 +463,7 @@ const sendChatRequest = async (body, options = {}) => {
                     'REQUEST'
                 )
                 if (backoffMs > 0) {
-                    await delay(backoffMs)
+                    await delay(jitter(backoffMs))
                 }
                 continue
             }
@@ -524,31 +515,22 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
         const chatBaseUrl = getChatBaseUrl()
         const proxyAgent = getProxyAgent(account)
 
-        const requestConfig = {
-            headers: {
-                'sec-ch-ua-platform': '"Windows"',
-                'referer': `${chatBaseUrl}/c/new-chat`,
-                'accept-language': 'zh-CN,zh;q=0.9',
-                'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-                'sec-ch-ua-mobile': '?0',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-                'content-type': 'application/json',
-                'accept': 'application/json, text/plain, */*',
-                'accept-encoding': 'gzip, deflate, br, zstd',
-                // WAF 客户端标识头
-                'source': 'web',
-                'version': '0.2.81',
-                'timezone': getTimezoneHeader(),
-                'x-request-id': generateUUID(),
-                'connection': 'keep-alive',
-                // Cookie: JWT token + SSXMOD 反爬链
-                'cookie': `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
-                'host': chatBaseUrl.replace('https://', ''),
-                'origin': chatBaseUrl,
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin',
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token: currentToken,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            accept: 'application/json, text/plain, */*',
+            refererPath: '/c/new-chat',
+            extra: {
+                'x-request-id': generateUUID()
             }
+        })
+
+        const requestConfig = {
+            headers
         }
 
         // 添加代理配置

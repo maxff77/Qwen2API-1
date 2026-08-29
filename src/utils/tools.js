@@ -55,11 +55,23 @@ const getTimezoneHeader = () => {
   return new Date().toString().replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, ' ').trim()
 }
 
+/**
+ * Add timing jitter to break machine-perfect patterns.
+ * @param {number} baseMs - Base delay in milliseconds
+ * @param {number} pct - Jitter percentage (0-1). Default 0.25 = ±25%
+ * @returns {number} Jittered delay in ms
+ */
+const jitter = (baseMs, pct = 0.25) => {
+  const range = baseMs * pct
+  return Math.max(0, Math.round(baseMs + (Math.random() * 2 - 1) * range))
+}
+
 module.exports = {
   isJson,
   sleep,
   sha256Encrypt,
   JwtDecode,
   generateUUID,
-  getTimezoneHeader
+  getTimezoneHeader,
+  jitter
 }

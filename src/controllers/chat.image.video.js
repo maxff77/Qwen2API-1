@@ -7,8 +7,9 @@ const { generateChatID } = require('../utils/request.js')
 const { uploadFileToQwenOss } = require('../utils/upload.js')
 const { parserModel } = require('../utils/chat-helpers.js')
 const { getDefaultModelByChatType } = require('../models/models-map.js')
-const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
+const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
+const { buildRequestHeaders } = require('../utils/header-profile')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
@@ -18,22 +19,22 @@ const HTTP_URL_REGEX = /^https?:\/\//i
  * @param {string} token - 当前账号令牌
  * @returns {string} Cookie 头
  */
-const buildUpstreamCookieHeader = (token) => {
+const buildUpstreamCookieHeader = (token, account) => {
     const cookieParts = []
 
     if (token) {
         cookieParts.push(`token=${token}`)
     }
 
-    const ssxmodItna = getSsxmodItna()
-    const ssxmodItna2 = getSsxmodItna2()
+    // Per-account SSXMOD when account context available; global fallback otherwise
+    const ssxmod = getSsxmodForAccount(account)
 
-    if (ssxmodItna) {
-        cookieParts.push(`ssxmod_itna=${ssxmodItna}`)
+    if (ssxmod.ssxmod_itna) {
+        cookieParts.push(`ssxmod_itna=${ssxmod.ssxmod_itna}`)
     }
 
-    if (ssxmodItna2) {
-        cookieParts.push(`ssxmod_itna2=${ssxmodItna2}`)
+    if (ssxmod.ssxmod_itna2) {
+        cookieParts.push(`ssxmod_itna2=${ssxmod.ssxmod_itna2}`)
     }
 
     return cookieParts.join('; ')
@@ -1036,15 +1037,20 @@ const getChatDetail = async (chatID, token) => {
         // 通过 token 反查 account 解析账号级代理（找不到则回退到全局 PROXY_URL）
         const account = accountManager.getAccountByToken(token)
         const proxyAgent = getProxyAgent(account)
-        const cookieHeader = buildUpstreamCookieHeader(token)
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            extra: {
+                'Authorization': `Bearer ${token}`
+            }
+        })
 
         const requestConfig = {
-            headers: {
-                "Authorization": `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(cookieHeader && { 'Cookie': cookieHeader })
-            }
+            headers
         }
 
         if (proxyAgent) {
@@ -1362,7 +1368,19 @@ const generateImageVideoResult = async (payload) => {
 
         const chatBaseUrl = getChatBaseUrl()
         const proxyAgent = getProxyAgent(account)
-        const cookieHeader = buildUpstreamCookieHeader(token)
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            accept: upstreamStream ? 'application/json, text/plain, */*' : 'application/json',
+            extra: {
+                'authorization': `Bearer ${token}`,
+                'bx-v': '2.5.36'
+            }
+        })
 
         logger.info('发送图片视频请求', 'CHAT')
         logger.info(`选择图片: ${selectedImageList[selectedImageList.length - 1] || '未选择图片，切换生成图/视频模式'}`, 'CHAT')
@@ -1375,25 +1393,7 @@ const generateImageVideoResult = async (payload) => {
         logger.info(`图片视频流策略: upstream=${upstreamStream} downstream=${payload.stream === true}`, 'CHAT')
 
         const requestConfig = {
-            headers: {
-                'authorization': `Bearer ${token}`,
-                'sec-ch-ua-platform': '"Windows"',
-                'referer': `${chatBaseUrl}/`,
-                'accept-language': 'zh-CN,zh;q=0.9',
-                'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-                'sec-ch-ua-mobile': '?0',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-                'content-type': 'application/json',
-                'bx-v': '2.5.36',
-                'accept': upstreamStream ? 'application/json, text/plain, */*' : 'application/json',
-                'accept-encoding': 'gzip, deflate, br, zstd',
-                ...(cookieHeader && { 'cookie': cookieHeader }),
-                'host': chatBaseUrl.replace('https://', ''),
-                'origin': chatBaseUrl,
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin',
-            },
+            headers,
             responseType: newChatType === 't2v' ? 'json' : (upstreamStream ? 'stream' : 'text'),
             timeout: 1000 * 60 * 5
         }
@@ -1853,15 +1853,20 @@ const getVideoTaskStatus = async (videoTaskID, token) => {
         const chatBaseUrl = getChatBaseUrl()
         const account = accountManager.getAccountByToken(token)
         const proxyAgent = getProxyAgent(account)
-        const cookieHeader = buildUpstreamCookieHeader(token)
+        // Antidetect: per-account fingerprint headers replace static block
+        const ssxmod = getSsxmodForAccount(account)
+        const headers = buildRequestHeaders(account, {
+            chatBaseUrl,
+            token,
+            ssxmodItna: ssxmod.ssxmod_itna,
+            ssxmodItna2: ssxmod.ssxmod_itna2,
+            extra: {
+                'Authorization': `Bearer ${token}`
+            }
+        })
 
         const requestConfig = {
-            headers: {
-                "Authorization": `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(cookieHeader && { 'Cookie': cookieHeader })
-            }
+            headers
         }
 
         // 添加代理配置

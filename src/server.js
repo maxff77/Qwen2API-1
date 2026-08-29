@@ -22,8 +22,7 @@ if (config.dataSaveMode === 'file') {
   }
 }
 
-// 初始化 SSXMOD Cookie 管理器
-initSsxmodManager()
+// SSXMOD initialization is now lazy (per-account); no startup side effect
 
 app.use(bodyParser.json({ limit: '128mb' }))
 app.use(bodyParser.urlencoded({ limit: '128mb', extended: true }))

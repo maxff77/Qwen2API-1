@@ -1,8 +1,9 @@
 const axios = require('axios')
 const accountManager = require('../utils/account.js')
-const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
+const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
-const { generateUUID, getTimezoneHeader } = require('../utils/tools.js')
+const { generateUUID } = require('../utils/tools.js')
+const { buildRequestHeaders } = require('../utils/header-profile')
 const { logger } = require('../utils/logger')
 const config = require('../config/index.js')
 
@@ -31,32 +32,21 @@ const getLatestModels = async (force = false) => {
     const account = accountManager.getAccount()
     const proxyAgent = getProxyAgent(account)
 
-    const requestConfig = {
-        headers: {
-            'sec-ch-ua-platform': '"Windows"',
-            'referer': `${chatBaseUrl}/`,
-            'accept-language': 'zh-CN,zh;q=0.9',
-            'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-            'sec-ch-ua-mobile': '?0',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-            'content-type': 'application/json',
-            'accept': '*/*',
-            'accept-encoding': 'gzip, deflate, br, zstd',
-            // WAF 客户端标识头
-            'source': 'web',
-            'version': '0.2.81',
-            'timezone': getTimezoneHeader(),
-            'x-request-id': generateUUID(),
-            'connection': 'keep-alive',
-            ...(account?.token && {
-                'cookie': `token=${account.token};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`
-            }),
-            'origin': chatBaseUrl,
-            'host': chatBaseUrl.replace('https://', ''),
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin',
+    // Antidetect: per-account fingerprint headers replace static block
+    const ssxmod = getSsxmodForAccount(account)
+    const headers = buildRequestHeaders(account, {
+        chatBaseUrl,
+        token: account?.token,
+        ssxmodItna: ssxmod.ssxmod_itna,
+        ssxmodItna2: ssxmod.ssxmod_itna2,
+        accept: '*/*',
+        extra: {
+            'x-request-id': generateUUID()
         }
+    })
+
+    const requestConfig = {
+        headers
     }
 
     // 添加代理配置

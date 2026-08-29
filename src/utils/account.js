@@ -3,6 +3,7 @@ const DataPersistence = require('./data-persistence')
 const TokenManager = require('./token-manager')
 const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
+const { generateDeterministicFingerprint } = require('./fingerprint')
 
 /**
  * 默认 daily stats 结构。返回新对象，调用方安全修改
@@ -12,6 +13,24 @@ const createDefaultStats = () => ({
     chat: { input: 0, output: 0 },
     cli: { calls: 0, input: 0, output: 0 }
 })
+
+/**
+ * Ensure account has a deterministic fingerprint.
+ * Generates one from SHA-256(email) if missing; persists on next save.
+ * @param {Object} account - Account object (mutated in place)
+ */
+const ensureAccountFingerprint = (account) => {
+    if (!account || !account.email) return
+    if (!account.fingerprint || typeof account.fingerprint !== 'object' || !account.fingerprint.deviceId) {
+        try {
+            account.fingerprint = generateDeterministicFingerprint(account.email)
+            logger.info(`Generated deterministic fingerprint for ${account.email}`, 'ACCOUNT')
+        } catch (err) {
+            logger.error(`Failed to generate fingerprint for ${account.email}: ${err.message}`, 'ACCOUNT')
+            // Fall back: leave undefined so header-profile uses legacy headers
+        }
+    }
+}
 
 /**
  * 保证账户具备 stats 和 statsHistory 字段（兼容老 data.json/Redis 数据）
@@ -155,6 +174,9 @@ class Account {
 
             // 兼容历史数据：旧 data.json/Redis 没有 stats 字段
             this.accountTokens.forEach(ensureStats)
+
+            // Antidetect: ensure every account has a deterministic fingerprint
+            this.accountTokens.forEach(ensureAccountFingerprint)
 
             // 如果是环境变量模式，需要进行登录获取令牌
             if (config.dataSaveMode === 'none' && this.accountTokens.length > 0) {

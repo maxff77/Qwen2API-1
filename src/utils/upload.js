@@ -4,6 +4,7 @@ const mimetypes = require('mime-types')
 const { logger } = require('./logger')
 const { generateUUID } = require('./tools.js')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
+const { buildRequestHeaders } = require('./header-profile')
 
 // 配置常量
 const UPLOAD_CONFIG = {
@@ -59,11 +60,15 @@ const getSimpleFileType = (mimeType) => {
  */
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
-const createAuthorizedHeaders = (authToken) => ({
-    'Authorization': authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`,
-    'Content-Type': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-})
+const createAuthorizedHeaders = (authToken, account) => {
+    // Antidetect: per-account fingerprint headers replace static UA
+    const base = buildRequestHeaders(account, {
+        extra: {
+            'Authorization': authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`
+        }
+    })
+    return base
+}
 
 const unwrapApiData = (response) => {
     const payload = response?.data
@@ -99,12 +104,14 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
         const bearerToken = authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`
         const proxyAgent = getProxyAgent(account)
 
-        const headers = {
-            'Authorization': bearerToken,
-            'Content-Type': 'application/json',
-            'x-request-id': requestId,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        // Antidetect: per-account fingerprint headers replace static UA
+        const baseHeaders = buildRequestHeaders(account, {
+            extra: {
+                'Authorization': bearerToken,
+                'x-request-id': requestId
+            }
+        })
+        const headers = baseHeaders
 
         const payload = {
             filename,
@@ -320,7 +327,7 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
 
     const baseUrl = getChatBaseUrl()
     const requestConfig = applyProxyToAxiosConfig({
-        headers: createAuthorizedHeaders(authToken),
+        headers: createAuthorizedHeaders(authToken, account),
         timeout: Math.max(1000, Number(options.timeoutMs) || 30000)
     }, account)
 

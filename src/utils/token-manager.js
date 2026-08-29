@@ -1,7 +1,8 @@
 const axios = require('axios')
-const { sha256Encrypt, JwtDecode } = require('./tools')
+const { sha256Encrypt, JwtDecode, jitter } = require('./tools')
 const { logger } = require('./logger')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
+const { buildUserAgent } = require('./header-profile')
 
 /**
  * 令牌管理器
@@ -9,6 +10,7 @@ const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./pr
  */
 class TokenManager {
     constructor() {
+        // Legacy default; overridden per-account when fingerprint is available
         this.defaultHeaders = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0'
         }
@@ -32,8 +34,10 @@ class TokenManager {
     async login(email, password, account) {
         try {
             const proxyAgent = getProxyAgent(account)
+            // Use per-account fingerprint UA when available; fall back to legacy Edge UA
+            const ua = (account && account.fingerprint) ? buildUserAgent(account.fingerprint) : this.defaultHeaders['User-Agent']
             const requestConfig = {
-                headers: this.defaultHeaders,
+                headers: { 'User-Agent': ua },
                 timeout: 10000 // 10秒超时
             }
 
@@ -197,8 +201,8 @@ class TokenManager {
                 failed.push(account)
             }
 
-            // 添加延迟避免请求过于频繁
-            await this._delay(1000)
+            // 添加延迟避免请求过于频繁 (jitter breaks machine-perfect timing)
+            await this._delay(jitter(1000))
         }
 
         logger.success(`令牌刷新完成: 成功 ${refreshed.length} 个，失败 ${failed.length} 个`, 'TOKEN')

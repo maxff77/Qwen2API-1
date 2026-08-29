@@ -1,17 +1,17 @@
 const config = require('../config/index.js')
 const { HttpsProxyAgent } = require('https-proxy-agent')
 
-// 按代理 URL 缓存 agent 实例（多账号共享同一代理时复用同一个 agent）
+// Per-account agent cache keyed by `${proxyUrl}::${email}`.
+// LRU eviction when cache exceeds MAX_AGENT_CACHE_SIZE.
 const proxyAgents = new Map()
+const MAX_AGENT_CACHE_SIZE = 50
 
-// 接受 http/https/socks5 协议；正则故意宽松，仅拦截最常见的拼写错误
-// （缺少协议、错误协议如 'htp://'），不强制 host 形态以免拒绝合法的
-// 含用户名/密码、IPv6、自定义路径的代理 URL
+// Accept http/https/socks5 protocols; regex intentionally loose to catch common typos only
 const PROXY_URL_REGEX = /^(https?|socks5):\/\/[^\s]+$/i
 
 /**
- * 校验代理 URL 格式
- * 空值（null/undefined/空字符串）视为合法（表示"无账号级代理"）
+ * Validate proxy URL format.
+ * Null/undefined/empty are valid (means "no account-level proxy").
  * @param {string|null|undefined} url
  * @returns {boolean}
  */
@@ -24,9 +24,9 @@ const isValidProxyUrl = (url) => {
 }
 
 /**
- * 解析账号实际使用的代理 URL
- * 优先级: account.proxy > 全局 PROXY_URL > 不使用代理
- * @param {Object} [account] - 账号对象（可选）
+ * Resolve the effective proxy URL for an account.
+ * Priority: account.proxy > global PROXY_URL > null
+ * @param {Object} [account]
  * @returns {string|null}
  */
 const resolveProxyUrl = (account) => {
@@ -37,65 +37,99 @@ const resolveProxyUrl = (account) => {
 }
 
 /**
- * 根据 URL 获取或创建代理 agent
+ * Evict oldest entry from agent cache when over limit.
+ * Map iteration order is insertion order, so first key is oldest.
+ */
+const evictOldestAgent = () => {
+    if (proxyAgents.size <= MAX_AGENT_CACHE_SIZE) return
+    const oldestKey = proxyAgents.keys().next().value
+    if (oldestKey !== undefined) {
+        const agent = proxyAgents.get(oldestKey)
+        try {
+            if (agent && typeof agent.destroy === 'function') agent.destroy()
+        } catch (_) {}
+        proxyAgents.delete(oldestKey)
+    }
+}
+
+/**
+ * Build cache key from proxy URL and account email.
  * @param {string|null} url
+ * @param {Object} [account]
+ * @returns {string}
+ */
+const buildAgentCacheKey = (url, account) => {
+    const email = account && account.email ? account.email : '__global__'
+    return `${url || ''}::${email}`
+}
+
+/**
+ * Get or create a proxy agent, keyed by proxy URL + account email.
+ * Separate TCP pools per account even when sharing the same proxy.
+ * @param {string|null} url
+ * @param {Object} [account]
  * @returns {HttpsProxyAgent|undefined}
  */
-const getOrCreateAgent = (url) => {
+const getOrCreateAgent = (url, account) => {
     if (!url) return undefined
-    let agent = proxyAgents.get(url)
+    const key = buildAgentCacheKey(url, account)
+    let agent = proxyAgents.get(key)
     if (!agent) {
         agent = new HttpsProxyAgent(url)
-        proxyAgents.set(url, agent)
+        proxyAgents.set(key, agent)
+        evictOldestAgent()
+    } else {
+        // Move to end (most recently used) by deleting and re-inserting
+        proxyAgents.delete(key)
+        proxyAgents.set(key, agent)
     }
     return agent
 }
 
 /**
- * 获取代理 Agent
- * @param {Object} [account] - 账号对象（可选）。未传则回退到全局 PROXY_URL
+ * Get proxy agent for an account.
+ * @param {Object} [account] - Account object (optional). Falls back to global PROXY_URL
  * @returns {HttpsProxyAgent|undefined}
  */
 const getProxyAgent = (account) => {
-    return getOrCreateAgent(resolveProxyUrl(account))
+    return getOrCreateAgent(resolveProxyUrl(account), account)
 }
 
 /**
- * 显式失效缓存中的某个代理 agent
- * 当账号代理 URL 被修改或删除时调用，释放底层 socket
+ * Invalidate cached agent for a specific proxy URL.
+ * Called when an account's proxy is changed or removed.
  * @param {string|null} url
  */
 const invalidateProxyAgent = (url) => {
     if (!url) return
-    const agent = proxyAgents.get(url)
-    if (!agent) return
-    try {
-        if (typeof agent.destroy === 'function') {
-            agent.destroy()
+    // Delete all entries matching this proxy URL (any account)
+    for (const [key, agent] of proxyAgents.entries()) {
+        if (key.startsWith(`${url}::`)) {
+            try {
+                if (typeof agent.destroy === 'function') agent.destroy()
+            } catch (_) {}
+            proxyAgents.delete(key)
         }
-    } catch (_) {
-        // destroy 失败不影响后续逻辑
     }
-    proxyAgents.delete(url)
 }
 
 /**
- * 获取 Chat API 基础 URL
+ * Get Chat API base URL.
  * @returns {string}
  */
 const getChatBaseUrl = () => config.qwenChatProxyUrl
 
 /**
- * 获取 CLI API 基础 URL
+ * Get CLI API base URL.
  * @returns {string}
  */
 const getCliBaseUrl = () => config.qwenCliProxyUrl
 
 /**
- * 为 axios 请求配置添加代理设置
- * 注意：account 作为第二个可选参数以保持向后兼容（旧调用点只传 requestConfig）
- * @param {Object} [requestConfig] - axios 请求配置对象
- * @param {Object} [account] - 账号对象（可选）
+ * Apply proxy settings to axios request config.
+ * Note: account as second optional param for backward compatibility.
+ * @param {Object} [requestConfig]
+ * @param {Object} [account]
  * @returns {Object}
  */
 const applyProxyToAxiosConfig = (requestConfig = {}, account) => {
@@ -108,9 +142,9 @@ const applyProxyToAxiosConfig = (requestConfig = {}, account) => {
 }
 
 /**
- * 为 fetch 请求配置添加代理设置
- * @param {Object} [fetchOptions] - fetch 请求配置对象
- * @param {Object} [account] - 账号对象（可选）
+ * Apply proxy settings to fetch options.
+ * @param {Object} [fetchOptions]
+ * @param {Object} [account]
  * @returns {Object}
  */
 const applyProxyToFetchOptions = (fetchOptions = {}, account) => {

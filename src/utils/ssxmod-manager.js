@@ -1,95 +1,91 @@
 /**
- * SSXMOD Cookie 管理器
- * 负责生成和定时刷新 ssxmod_itna 和 ssxmod_itna2 Cookie
+ * SSXMOD Cookie Manager — per-account cache with TTL.
+ * Eliminates global cookie correlation by keying on account email.
+ * Lazy regeneration on cache miss; no global timer.
  */
 
 const { generateCookies } = require('./cookie-generator');
 const { logger } = require('./logger');
 
-// 全局 Cookie 存储
-let currentCookies = {
-    ssxmod_itna: '',
-    ssxmod_itna2: '',
-    timestamp: 0
-};
+// Per-account cookie cache: Map<email, {ssxmod_itna, ssxmod_itna2, timestamp}>
+const accountCache = new Map();
 
-// 刷新间隔 (15分钟)
-const REFRESH_INTERVAL = 15 * 60 * 1000;
-
-// 定时器引用
-let refreshTimer = null;
+// Cache TTL: 15 minutes (matches previous refresh interval)
+const CACHE_TTL_MS = 15 * 60 * 1000;
 
 /**
- * 刷新 SSXMOD Cookie
+ * Get or lazily generate SSXMOD cookies for a specific account.
+ * @param {Object} account - Account object (must have .email)
+ * @returns {{ssxmod_itna: string, ssxmod_itna2: string}}
  */
-function refreshCookies() {
+function getSsxmodForAccount(account) {
+    const email = account && account.email;
+    if (!email) {
+        // Fallback for calls without account context — use a synthetic key
+        return getOrGenerate('__global__');
+    }
+    return getOrGenerate(email);
+}
+
+/**
+ * Internal: get from cache or generate fresh cookies.
+ * @param {string} key
+ * @returns {{ssxmod_itna: string, ssxmod_itna2: string}}
+ */
+function getOrGenerate(key) {
+    const cached = accountCache.get(key);
+    const now = Date.now();
+    if (cached && (now - cached.timestamp) < CACHE_TTL_MS) {
+        return { ssxmod_itna: cached.ssxmod_itna, ssxmod_itna2: cached.ssxmod_itna2 };
+    }
     try {
         const result = generateCookies();
-        currentCookies = {
+        accountCache.set(key, {
             ssxmod_itna: result.ssxmod_itna,
             ssxmod_itna2: result.ssxmod_itna2,
-            timestamp: result.timestamp
-        };
-        logger.info(`SSXMOD Cookie 已刷新`, 'SSXMOD');
-    } catch (error) {
-        logger.error('SSXMOD Cookie 刷新失败', 'SSXMOD', '', error.message);
+            timestamp: now
+        });
+        return { ssxmod_itna: result.ssxmod_itna, ssxmod_itna2: result.ssxmod_itna2 };
+    } catch (err) {
+        logger.error(`SSXMOD generation failed for ${key}: ${err.message}`, 'SSXMOD');
+        // Return empty strings rather than crashing the request
+        return { ssxmod_itna: '', ssxmod_itna2: '' };
     }
 }
 
+// Legacy API compatibility — returns global-fallback values
+function getSsxmodItna() {
+    return getOrGenerate('__global__').ssxmod_itna;
+}
+
+function getSsxmodItna2() {
+    return getOrGenerate('__global__').ssxmod_itna2;
+}
+
+function getCookies() {
+    const g = getOrGenerate('__global__');
+    return { ssxmod_itna: g.ssxmod_itna, ssxmod_itna2: g.ssxmod_itna2, timestamp: Date.now() };
+}
+
 /**
- * 初始化 SSXMOD 管理器
- * 启动时生成一次 Cookie，并设置定时刷新
+ * No-op: initialization is now lazy. Kept for backward compatibility.
  */
 function initSsxmodManager() {
-    // 立即生成一次
-    refreshCookies();
-
-    // 设置定时刷新 (每15分钟)
-    if (refreshTimer) {
-        clearInterval(refreshTimer);
-    }
-    refreshTimer = setInterval(refreshCookies, REFRESH_INTERVAL);
-
-    logger.info(`SSXMOD 管理器已启动，刷新间隔: ${REFRESH_INTERVAL / 1000 / 60} 分钟`, 'SSXMOD');
+    // Intentionally empty — lazy init replaces startup side effect
 }
 
-/**
- * 获取当前 ssxmod_itna
- * @returns {string} ssxmod_itna 值
- */
-function getSsxmodItna() {
-    return currentCookies.ssxmod_itna;
+function refreshCookies() {
+    // Refresh global fallback entry
+    getOrGenerate('__global__');
 }
 
-/**
- * 获取当前 ssxmod_itna2
- * @returns {string} ssxmod_itna2 值
- */
-function getSsxmodItna2() {
-    return currentCookies.ssxmod_itna2;
-}
-
-/**
- * 获取完整的 Cookie 对象
- * @returns {Object} 包含 ssxmod_itna 和 ssxmod_itna2 的对象
- */
-function getCookies() {
-    return { ...currentCookies };
-}
-
-/**
- * 停止定时刷新
- */
 function stopRefresh() {
-    if (refreshTimer) {
-        clearInterval(refreshTimer);
-        refreshTimer = null;
-        logger.info('SSXMOD 定时刷新已停止', 'SSXMOD');
-    }
+    // No timer to stop in lazy model
 }
 
 module.exports = {
     initSsxmodManager,
+    getSsxmodForAccount,
     getSsxmodItna,
     getSsxmodItna2,
     getCookies,

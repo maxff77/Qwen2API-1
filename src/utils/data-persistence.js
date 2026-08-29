@@ -265,6 +265,7 @@ class DataPersistence {
       if (accountData.proxy !== undefined) merged.proxy = accountData.proxy ?? null
       if (accountData.stats !== undefined) merged.stats = accountData.stats
       if (accountData.statsHistory !== undefined) merged.statsHistory = accountData.statsHistory
+      if (accountData.fingerprint !== undefined) merged.fingerprint = accountData.fingerprint
 
       if (existingIndex !== -1) {
         data.accounts[existingIndex] = merged
@@ -305,7 +306,8 @@ class DataPersistence {
         expires: account.expires,
         proxy: account.proxy ?? null,
         stats: account.stats ?? undefined,
-        statsHistory: account.statsHistory ?? undefined
+        statsHistory: account.statsHistory ?? undefined,
+        fingerprint: account.fingerprint ?? undefined
       }))
 
       await this._writeDataFile(data)
