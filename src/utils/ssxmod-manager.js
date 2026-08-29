@@ -13,6 +13,9 @@ const accountCache = new Map();
 // Cache TTL: 15 minutes (matches previous refresh interval)
 const CACHE_TTL_MS = 15 * 60 * 1000;
 
+// Maximum number of cached accounts to prevent unbounded memory growth
+const MAX_CACHE_SIZE = 100;
+
 /**
  * Get or lazily generate SSXMOD cookies for a specific account.
  * @param {Object} account - Account object (must have .email)
@@ -32,6 +35,14 @@ function getSsxmodForAccount(account) {
  * @param {string} key
  * @returns {{ssxmod_itna: string, ssxmod_itna2: string}}
  */
+function evictOldestSsxmod() {
+    if (accountCache.size <= MAX_CACHE_SIZE) return;
+    const oldestKey = accountCache.keys().next().value;
+    if (oldestKey !== undefined) {
+        accountCache.delete(oldestKey);
+    }
+}
+
 function getOrGenerate(key) {
     const cached = accountCache.get(key);
     const now = Date.now();
@@ -45,6 +56,7 @@ function getOrGenerate(key) {
             ssxmod_itna2: result.ssxmod_itna2,
             timestamp: now
         });
+        evictOldestSsxmod();
         return { ssxmod_itna: result.ssxmod_itna, ssxmod_itna2: result.ssxmod_itna2 };
     } catch (err) {
         logger.error(`SSXMOD generation failed for ${key}: ${err.message}`, 'SSXMOD');

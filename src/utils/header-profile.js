@@ -111,8 +111,11 @@ function buildRequestHeaders(account, options = {}) {
             headers['host'] = options.chatBaseUrl.replace(/^https?:\/\//, '')
             headers['origin'] = options.chatBaseUrl
         }
-        if (options.token && options.ssxmodItna) {
-            headers['cookie'] = `token=${options.token};ssxmod_itna=${options.ssxmodItna};ssxmod_itna2=${options.ssxmodItna2 || ''}`
+        if (options.token) {
+            const cookieParts = [`token=${options.token}`]
+            if (options.ssxmodItna) cookieParts.push(`ssxmod_itna=${options.ssxmodItna}`)
+            if (options.ssxmodItna2) cookieParts.push(`ssxmod_itna2=${options.ssxmodItna2}`)
+            headers['cookie'] = cookieParts.join(';')
         }
         if (options.extra) Object.assign(headers, options.extra)
         return headers
@@ -124,8 +127,9 @@ function buildRequestHeaders(account, options = {}) {
     const secChPlatform = fp ? platformToSecChUa(fp.platform) : LEGACY_HEADERS['sec-ch-ua-platform']
     const language = fp ? fp.language || 'zh-CN' : 'zh-CN'
 
-    // Derive timezone from fingerprint offset; fall back to server TZ only when missing
-    const tzOffset = fp && fp.timezoneOffset ? parseInt(fp.timezoneOffset, 10) : null
+    // Derive timezone from fingerprint offset; fall back to server TZ only when missing or invalid
+    const rawTz = fp && fp.timezoneOffset != null ? Number(fp.timezoneOffset) : NaN
+    const tzOffset = Number.isFinite(rawTz) ? Math.trunc(rawTz) : null
     const timezone = tzOffset !== null
         ? `UTC${tzOffset <= 0 ? '+' : '-'}${String(Math.abs(tzOffset) / 60).padStart(2, '0')}`
         : getTimezoneHeader()
@@ -154,8 +158,11 @@ function buildRequestHeaders(account, options = {}) {
         headers['origin'] = options.chatBaseUrl
     }
 
-    if (options.token && options.ssxmodItna) {
-        headers['cookie'] = `token=${options.token};ssxmod_itna=${options.ssxmodItna};ssxmod_itna2=${options.ssxmodItna2 || ''}`
+    if (options.token) {
+        const cookieParts = [`token=${options.token}`]
+        if (options.ssxmodItna) cookieParts.push(`ssxmod_itna=${options.ssxmodItna}`)
+        if (options.ssxmodItna2) cookieParts.push(`ssxmod_itna2=${options.ssxmodItna2}`)
+        headers['cookie'] = cookieParts.join(';')
     }
 
     if (options.extra) Object.assign(headers, options.extra)
