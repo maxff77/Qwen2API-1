@@ -101,6 +101,288 @@ test('native tool accumulator rebuilds fragmented OpenAI tool deltas', () => {
   assert.equal(accumulator.hasParseError(), false)
 })
 
+// ---- Modo nativo Qwen: `delta.function_call` con `arguments` como SNAPSHOT acumulativo ----
+// Fixtures byte-fieles a scratchpad/capture-foreign.txt (probe 2026-09-01, qwen3.8-max):
+// cada frame trae el snapshot completo hasta ese punto, el snapshot final llega DOS veces,
+// sin function_id, phase "answer". Las llamadas paralelas llegan en serie (9 SendMessage, 10 Bash).
+const SEND_MESSAGE_SNAPSHOTS = [
+  '',
+  '{"to": ',
+  '{"to": "riky',
+  '{"to": "riky"',
+  '{"to": "riky", "message": ',
+  '{"to": "riky", "message": "build is green',
+  '{"to": "riky", "message": "build is green"',
+  '{"to": "riky", "message": "build is green"}'
+]
+SEND_MESSAGE_SNAPSHOTS.push(SEND_MESSAGE_SNAPSHOTS[SEND_MESSAGE_SNAPSHOTS.length - 1])
+const SEND_MESSAGE_ARGS = SEND_MESSAGE_SNAPSHOTS[SEND_MESSAGE_SNAPSHOTS.length - 1]
+
+const BASH_SNAPSHOTS = [
+  '',
+  '{"command": ',
+  '{"command": "git status',
+  '{"command": "git status"',
+  '{"command": "git status", "description": "Check',
+  '{"command": "git status", "description": "Check git status on user',
+  '{"command": "git status", "description": "Check git status on user\'s machine',
+  '{"command": "git status", "description": "Check git status on user\'s machine"',
+  '{"command": "git status", "description": "Check git status on user\'s machine"}'
+]
+BASH_SNAPSHOTS.push(BASH_SNAPSHOTS[BASH_SNAPSHOTS.length - 1])
+const BASH_ARGS = BASH_SNAPSHOTS[BASH_SNAPSHOTS.length - 1]
+
+// Frame de plataforma (code_interpreter): phase propia + function_id round_N_call_<hex>.
+const CODE_INTERPRETER_ID = 'round_0_call_45542fe59a8346bf888dd458'
+const CODE_INTERPRETER_SNAPSHOTS = ['', '{"code": "ls', '{"code": "ls -1 /tmp"}', '{"code": "ls -1 /tmp"}']
+
+const feedNative = (accumulator, name, snapshots, extra = {}) => {
+  for (const snapshot of snapshots) {
+    accumulator.pushNativeSnapshot({ name, arguments: snapshot, phase: 'answer', ...extra })
+  }
+}
+
+const captureToolWarns = (fn) => {
+  const { logger } = require('../src/utils/logger.js')
+  const saved = logger.warn
+  const lines = []
+  logger.warn = (msg) => { lines.push(String(msg)) }
+  try {
+    fn()
+  } finally {
+    logger.warn = saved
+  }
+  return lines
+}
+
+test('native accumulator twin: OpenAI deltas APPEND, Qwen snapshots REPLACE', () => {
+  // OpenAI: fragmentos que se concatenan (semantica de :91-102, intacta).
+  const openai = createNativeToolCallAccumulator({ allowedToolNames: ['read_file'] })
+  openai.push([{ index: 0, id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '' } }])
+  openai.push([{ index: 0, function: { arguments: '{"path":' } }])
+  openai.push([{ index: 0, function: { arguments: '"a"}' } }])
+  assert.equal(openai.finalize()[0].function.arguments, '{"path":"a"}')
+
+  // Qwen nativo: snapshots acumulativos, el final duplicado. `+=` daria el JSON doblado.
+  const native = createNativeToolCallAccumulator({ allowedToolNames: ['SendMessage'] })
+  feedNative(native, 'SendMessage', SEND_MESSAGE_SNAPSHOTS)
+  assert.equal(native.closeByName('SendMessage'), true)
+  const calls = native.takeCompleted()
+  assert.equal(calls.length, 1, 'el snapshot final duplicado debe ser UNA llamada')
+  assert.equal(calls[0].function.name, 'SendMessage')
+  assert.equal(calls[0].function.arguments, SEND_MESSAGE_ARGS)
+  assert.equal(calls[0].type, 'function')
+  assert.match(calls[0].id, /^call_[0-9a-f]{24}$/, 'id fresco, nunca el function_id de la plataforma')
+  assert.equal(native.hasParseError(), false)
+  assert.deepEqual(native.getErrors(), [])
+})
+
+test('native S2: un nombre distinto abre una segunda llamada (SendMessage → Bash)', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['SendMessage', 'Bash'] })
+  feedNative(accumulator, 'SendMessage', SEND_MESSAGE_SNAPSHOTS)
+  feedNative(accumulator, 'Bash', BASH_SNAPSHOTS)
+  // Antes de los result frames: 2 abiertas (una cerrada por split), 0 confirmadas por resultado.
+  assert.deepEqual(accumulator.batchState(), { opened: 2, closedByResult: 0, gated: 1 })
+  assert.equal(accumulator.hasOpenClientCalls(), true)
+  assert.equal(accumulator.closeByName('SendMessage'), true)
+  assert.equal(accumulator.closeByName('Bash'), true)
+  assert.equal(accumulator.hasOpenClientCalls(), false)
+  assert.deepEqual(accumulator.batchState(), { opened: 2, closedByResult: 2, gated: 2 })
+
+  const calls = accumulator.takeCompleted()
+  assert.deepEqual(calls.map(c => c.function.name), ['SendMessage', 'Bash'])
+  assert.equal(calls[0].function.arguments, SEND_MESSAGE_ARGS)
+  assert.equal(calls[1].function.arguments, BASH_ARGS)
+  assert.deepEqual(calls.map(c => c.index), [0, 1])
+  assert.deepEqual(accumulator.getErrors(), [])
+})
+
+test('native S4: mismo nombre seguido, la segunda abre con "" → dos llamadas', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  feedNative(accumulator, 'Bash', BASH_SNAPSHOTS)
+  feedNative(accumulator, 'Bash', ['', '{"command": ', '{"command": "ls"}', '{"command": "ls"}'])
+  assert.equal(accumulator.closeOpen('round_end'), true)
+  const calls = accumulator.takeCompleted()
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].function.arguments, BASH_ARGS)
+  assert.equal(calls[1].function.arguments, '{"command": "ls"}')
+  assert.deepEqual(accumulator.getErrors(), [])
+})
+
+test('native closeByName es FIFO: el primer result "Bash" confirma Bash#1 (cerrada por split), no la Bash#2 abierta', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  feedNative(accumulator, 'Bash', BASH_SNAPSHOTS)
+  feedNative(accumulator, 'Bash', ['', '{"command": "ls"}'])
+  assert.equal(accumulator.closeByName('Bash'), true)
+  assert.equal(accumulator.hasOpenClientCalls(), true, 'Bash#2 sigue abierta hasta SU result frame')
+  assert.deepEqual(accumulator.batchState(), { opened: 2, closedByResult: 1, gated: 1 })
+  assert.equal(accumulator.closeByName('Bash'), true)
+  assert.equal(accumulator.hasOpenClientCalls(), false)
+  assert.deepEqual(accumulator.batchState(), { opened: 2, closedByResult: 2, gated: 2 })
+  assert.equal(accumulator.closeByName('Bash'), false, 'un tercer result sin llamada pendiente no reclama nada')
+  assert.deepEqual(accumulator.takeCompleted().map(c => c.function.arguments), [BASH_ARGS, '{"command": "ls"}'])
+})
+
+test('native S3: snapshot abierto ya completo + entrante distinto que no lo extiende → nueva llamada', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  feedNative(accumulator, 'Bash', ['{"command": "git status"}'])
+  // Sin frame "" intermedio: solo S3 puede partir aqui.
+  feedNative(accumulator, 'Bash', ['{"command": "ls', '{"command": "ls"}'])
+  accumulator.closeOpen('round_end')
+  const calls = accumulator.takeCompleted()
+  assert.deepEqual(calls.map(c => c.function.arguments), ['{"command": "git status"}', '{"command": "ls"}'])
+})
+
+test('native dedupe: un reopen byte-identico tras closeByName se descarta', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  feedNative(accumulator, 'Bash', BASH_SNAPSHOTS)
+  assert.equal(accumulator.closeByName('Bash'), true)
+  // El snapshot final duplicado puede llegar a horcajadas del result frame.
+  accumulator.pushNativeSnapshot({ name: 'Bash', arguments: BASH_ARGS, phase: 'answer' })
+  assert.equal(accumulator.hasOpenClientCalls(), false, 'el duplicado no debe reabrir')
+  assert.deepEqual(accumulator.batchState(), { opened: 1, closedByResult: 1, gated: 1 })
+  assert.equal(accumulator.takeCompleted().length, 1)
+  assert.deepEqual(accumulator.getErrors(), [])
+})
+
+test('native regression: un snapshot mas corto sobre uno abierto no-JSON se ignora y se avisa', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  const lines = captureToolWarns(() => {
+    accumulator.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "git st', phase: 'answer' })
+    accumulator.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "gi', phase: 'answer' })
+    accumulator.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "git status"}', phase: 'answer' })
+  })
+  assert.equal(lines.filter(l => /snapshot_regression/.test(l)).length, 1, lines.join('\n'))
+  assert.equal(accumulator.hasOpenClientCalls(), true, 'la regresion no abre ni cierra nada')
+  accumulator.closeByName('Bash')
+  const calls = accumulator.takeCompleted()
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].function.arguments, '{"command": "git status"}')
+})
+
+test('native platform-own: function_id presente → unknown_tool, jamas emitible, fuera del tally', () => {
+  for (const allowed of [['Bash'], ['Bash', 'code_interpreter']]) {
+    const accumulator = createNativeToolCallAccumulator({ allowedToolNames: allowed })
+    for (const snapshot of CODE_INTERPRETER_SNAPSHOTS) {
+      accumulator.pushNativeSnapshot({
+        name: 'code_interpreter', arguments: snapshot, phase: 'code_interpreter', functionId: CODE_INTERPRETER_ID
+      })
+    }
+    assert.equal(accumulator.hasAny(), true)
+    assert.equal(accumulator.hasOpenClientCalls(), false, 'una llamada de plataforma no es cliente')
+    assert.equal(accumulator.closeByName('code_interpreter'), true)
+    assert.deepEqual(accumulator.takeCompleted(), [], `allowed=${allowed}`)
+    assert.deepEqual(accumulator.getErrors(), [{ type: 'unknown_tool', name: 'code_interpreter' }])
+    assert.deepEqual(accumulator.batchState(), { opened: 0, closedByResult: 0, gated: 0 })
+  }
+  // Sin function_id pero phase no-answer (think): tampoco es candidata cliente.
+  const thinking = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  thinking.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "ls"}', phase: 'think' })
+  thinking.closeOpen('round_end')
+  assert.deepEqual(thinking.takeCompleted(), [])
+  assert.equal(thinking.getErrors()[0].type, 'unknown_tool')
+})
+
+test('native fail closed: allowlist vacia o ausente → nada emitible, sin throw', () => {
+  for (const allowedToolNames of [[], undefined, null, new Set()]) {
+    const accumulator = createNativeToolCallAccumulator({ allowedToolNames })
+    feedNative(accumulator, 'Bash', BASH_SNAPSHOTS)
+    accumulator.closeByName('Bash')
+    assert.deepEqual(accumulator.takeCompleted(), [])
+    assert.deepEqual(accumulator.getErrors(), [{ type: 'unknown_tool', name: 'Bash' }])
+  }
+  const wrongName = createNativeToolCallAccumulator({ allowedToolNames: ['Read'] })
+  feedNative(wrongName, 'Bash', BASH_SNAPSHOTS)
+  wrongName.closeByName('Bash')
+  assert.deepEqual(wrongName.takeCompleted(), [])
+  assert.deepEqual(wrongName.getErrors(), [{ type: 'unknown_tool', name: 'Bash' }])
+  assert.deepEqual(wrongName.batchState(), { opened: 1, closedByResult: 1, gated: 0 })
+})
+
+test('native shape: JSON que no es objeto plano → invalid_arguments', () => {
+  for (const args of ['[1]', 'null', '"x"', '42', '{"command": ']) {
+    const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+    accumulator.pushNativeSnapshot({ name: 'Bash', arguments: args, phase: 'answer' })
+    accumulator.closeByName('Bash')
+    assert.deepEqual(accumulator.takeCompleted(), [], args)
+    assert.deepEqual(accumulator.getErrors(), [{ type: 'invalid_arguments', name: 'Bash' }], args)
+  }
+})
+
+test('native truncation: abierta al fin de ronda con snapshot no parseable → truncated_native_call', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  accumulator.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "git st', phase: 'answer' })
+  assert.equal(accumulator.closeOpen('round_end'), true)
+  assert.deepEqual(accumulator.takeCompleted(), [])
+  assert.deepEqual(accumulator.getErrors(), [{ type: 'truncated_native_call', name: 'Bash' }])
+  assert.equal(accumulator.hasParseError(), true)
+})
+
+test('native missing name: frame sin nombre → missing_tool_name', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  accumulator.pushNativeSnapshot({ name: '', arguments: '{"command": "ls"}', phase: 'answer' })
+  accumulator.closeOpen('round_end')
+  assert.deepEqual(accumulator.takeCompleted(), [])
+  assert.equal(accumulator.getErrors()[0].type, 'missing_tool_name')
+})
+
+const BASH_SCHEMA = {
+  type: 'object',
+  properties: { command: { type: 'string' }, description: { type: 'string' } },
+  required: ['command']
+}
+
+test('native schema (advisory): falta un required → schema_mismatch; clave extra → emite y avisa', () => {
+  const missing = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'], toolSchemas: { Bash: BASH_SCHEMA } })
+  missing.pushNativeSnapshot({ name: 'Bash', arguments: '{"description": "no command"}', phase: 'answer' })
+  missing.closeByName('Bash')
+  assert.deepEqual(missing.takeCompleted(), [])
+  assert.equal(missing.getErrors().length, 1)
+  assert.equal(missing.getErrors()[0].type, 'schema_mismatch')
+  assert.equal(missing.getErrors()[0].name, 'Bash')
+
+  const extra = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'], toolSchemas: { Bash: BASH_SCHEMA } })
+  const lines = captureToolWarns(() => {
+    extra.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "ls", "timeout": 5}', phase: 'answer' })
+    extra.closeByName('Bash')
+  })
+  const calls = extra.takeCompleted()
+  assert.equal(calls.length, 1, 'una clave extra NO bloquea (advisory)')
+  assert.equal(calls[0].function.arguments, '{"command": "ls", "timeout": 5}')
+  assert.deepEqual(extra.getErrors(), [])
+  assert.ok(lines.some(l => /timeout/.test(l)), `expected an extra-key warn naming the key, got:\n${lines.join('\n')}`)
+
+  // Sin schema para ese nombre: no hay comprobacion, se emite.
+  const noSchema = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'], toolSchemas: {} })
+  noSchema.pushNativeSnapshot({ name: 'Bash', arguments: '{"whatever": 1}', phase: 'answer' })
+  noSchema.closeByName('Bash')
+  assert.equal(noSchema.takeCompleted().length, 1)
+})
+
+test('native takeCompleted es idempotente y finalize() no duplica errores', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  feedNative(accumulator, 'Bash', BASH_SNAPSHOTS)
+  accumulator.closeByName('Bash')
+  assert.equal(accumulator.takeCompleted().length, 1)
+  assert.deepEqual(accumulator.takeCompleted(), [], 'la segunda llamada drena nada')
+  assert.deepEqual(accumulator.finalize(), [], 'finalize() tras takeCompleted no re-emite')
+
+  const broken = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  broken.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": ', phase: 'answer' })
+  broken.closeByName('Bash')
+  assert.deepEqual(broken.finalize(), [])
+  assert.deepEqual(broken.finalize(), [])
+  assert.equal(broken.getErrors().length, 1, 'finalize() dos veces no debe duplicar el error')
+
+  // Consumidor legacy: finalize() cierra lo abierto (round_end) y drena de una vez.
+  const legacy = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  feedNative(legacy, 'Bash', BASH_SNAPSHOTS)
+  const finalized = legacy.finalize()
+  assert.equal(finalized.length, 1)
+  assert.equal(finalized[0].function.arguments, BASH_ARGS)
+  assert.deepEqual(legacy.finalize(), [])
+})
+
 // 模型不总是照抄标签。这些变体以前都不匹配字面量，于是整段 XML 作为正文泄漏，
 // 而且不记录任何错误 —— 既不 502 也不重试，调用方只看到裸 XML。
 const TAG_VARIANTS = [

@@ -1,6 +1,6 @@
 const { logger } = require('./logger')
 const { sha256Encrypt, generateUUID } = require('./tools.js')
-const { normalizeAllowedToolNames } = require('./tool-prompt.js')
+const { normalizeAllowedToolNames, ANSWER_PHASES } = require('./tool-prompt.js')
 const { uploadFileToQwenOss } = require('./upload.js')
 const { getLatestModels } = require('../models/models-map.js')
 const accountManager = require('./account.js')
@@ -506,7 +506,7 @@ const processOriginalLogic = async (messages, thinking_config, chat_type, imgCac
  * @returns {boolean}
  */
 const isThinkPhase = (phase) => phase === 'think' || phase === 'thinking' || phase === 'thinking_summary'
-const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response'])
+// ANSWER_PHASES 从 tool-prompt.js 引入：原生工具调用累积器用同一集合判定客户端候选。
 
 /**
  * 创建上游 delta 归一化器：将 thinking_summary 的 extra.summary_thought 增量转为 phase=think 的 content

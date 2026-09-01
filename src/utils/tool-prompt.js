@@ -908,6 +908,10 @@ const normalizeAllowedToolNames = (allowedToolNames) => {
   return names.size > 0 ? names : null;
 };
 
+// 上游 delta 的"正文"phase 集合。单一来源：chat-helpers.js 的归一化器与下面的原生
+// 累积器共用（chat-helpers 已依赖本模块，反向引用会成环，所以定义放在这里）。
+const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response']);
+
 const serializeToolArguments = (args) => {
   if (typeof args === 'string') {
     try {
@@ -1883,13 +1887,203 @@ const createToolCallStreamParser = (options = {}) => {
   };
 };
 
+const isCompleteJson = (text) => {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch (_) {
+    return false;
+  }
+};
+
 /**
- * 累积 OpenAI 原生 delta.tool_calls。网页上游一旦开始原生返回工具调用，桥接层无需再依赖 XML。
+ * 累积原生工具调用。两种喂入模式，各自独立：
+ *
+ * 1. `push(deltas)` —— OpenAI 形状的 `delta.tool_calls`：按 index 键控，arguments 是**增量**，
+ *    逐段拼接。语义原样保留（tests/tool-prompt.test.js:91-102）。
+ * 2. `pushNativeSnapshot({ name, arguments, phase, functionId })` —— Qwen 网页端的
+ *    `delta.function_call`：arguments 是**累积快照**（每帧带到目前为止的全文，最终快照
+ *    发两遍，抓包 2026-09-01），因此是**替换**而非拼接；调用之间没有 index，靠帧的形状
+ *    划界。并行调用串行到达（先 9 帧 SendMessage，再 10 帧 Bash）。
+ *
+ * 划界谓词（默认**合并** —— 误分裂 = 副作用执行两次，不可恢复；误合并 = JSON 不合法 →
+ * 重试，可恢复）。新调用当且仅当：
+ *   S1 双方都带 functionId 且不同；
+ *   S2 入帧名字与打开中的调用不同（无名入帧不算不同）；
+ *   S3 打开中的快照已是完整 JSON，且入帧 ≠ 它、也不以它为前缀；
+ *   S4 入帧 arguments 为 '' 而打开中的非空；
+ *   S5 当前没有打开中的调用（前一个已被边界关闭）。
+ * 但 S5 下若入帧与本轮**已关闭**的某个调用 name+arguments 逐字节相同 → 重复帧，丢弃
+ * （最终快照的副本跨过 result 帧到达时就是这个样子）。合并时保留最长的连贯快照：入帧
+ * 更短而打开中的还不是完整 JSON → 保留旧的，记 snapshot_regression。
+ *
+ * 结构分类（全部消费者共用）：无 functionId 且 phase ∈ ANSWER_PHASES → **客户端候选**；
+ * 否则是平台自有调用（code_interpreter / web_search 之类）→ 关闭时记 unknown_tool，
+ * 保持今天"平台调用 → tool_error 重试"的语义，绝不发射。名字本身不是判据：客户端可以
+ * 声明一个恰好叫 web_search 的工具。
+ *
+ * 关闭：closeByName(name) —— 带名字的 role:function 结果帧；closeOpen(reason) ——
+ * 另一个调用开始 / 正文恢复 / 回合结束（reason 'round_end' 让不可解析的快照记
+ * truncated_native_call 而非 invalid_arguments）。关闭即判定，错误每个调用只记一次：
+ * missing_tool_name / unknown_tool（平台自有或不在白名单；白名单为空 fail closed）/
+ * invalid_arguments（JSON 不合法或不是普通对象）/ truncated_native_call /
+ * schema_mismatch（有 schema 且缺 required 键；多出的键只告警不拦 —— 与抢救闸门
+ * gateSalvagedPayload 刻意不同，那道闸门对重塑文本 fail closed，这条通道的负载是模型
+ * 原样写的）。
+ *
+ * 取出：takeCompleted() 只排出已关闭、过闸、尚未排出的客户端调用（id 为新 UUID，绝不回显
+ * functionId）；finalize() 供旧消费者：先按 round_end 关闭打开中的，再一次性排出全部
+ * 未排出的（两种模式），单发 —— 再次调用返回 []，不重记错误。
+ * 统计：batchState() → { opened, closedByResult, gated }（只数客户端调用；平台调用两侧都
+ * 不计），hasOpenClientCalls()。早停条件 = opened > 0 ∧ opened === closedByResult ∧ gated ≥ 1，
+ * 由调用方在正文恢复帧上判定。
+ *
+ * @param {{ allowedToolNames?: Iterable<string>|Set<string>, toolSchemas?: Object<string, Object> }} [options]
  */
 const createNativeToolCallAccumulator = (options = {}) => {
   const allowedToolNames = normalizeAllowedToolNames(options.allowedToolNames);
+  const toolSchemas = options.toolSchemas && typeof options.toolSchemas === 'object' ? options.toolSchemas : null;
   const calls = new Map();
   const errors = [];
+  const nativeCalls = [];
+  let openCall = null;
+  let emittedCount = 0;
+  let finalized = false;
+
+  const isClientCall = (call) => !call.functionId && ANSWER_PHASES.has(call.phase);
+
+  const buildEmitted = (name, args) => ({
+    index: emittedCount++,
+    id: `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
+    type: 'function',
+    function: { name, arguments: args }
+  });
+
+  /** 关闭即判定：过闸的标 emittable，其余记一次错误。 */
+  const judgeNativeCall = (call) => {
+    if (!call.name) {
+      errors.push({ type: 'missing_tool_name', index: nativeCalls.indexOf(call) });
+      return;
+    }
+    if (!isClientCall(call) || !allowedToolNames || !allowedToolNames.has(call.name)) {
+      errors.push({ type: 'unknown_tool', name: call.name });
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(call.arguments);
+    } catch (_) {
+      errors.push({
+        type: call.closeReason === 'round_end' ? 'truncated_native_call' : 'invalid_arguments',
+        name: call.name
+      });
+      return;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      errors.push({ type: 'invalid_arguments', name: call.name });
+      return;
+    }
+    if (toolSchemas && Object.prototype.hasOwnProperty.call(toolSchemas, call.name)) {
+      const schema = toolSchemas[call.name];
+      const required = Array.isArray(schema?.required) ? schema.required : [];
+      const missing = required.filter(key => !Object.prototype.hasOwnProperty.call(parsed, key));
+      if (missing.length) {
+        errors.push({ type: 'schema_mismatch', name: call.name, missing });
+        return;
+      }
+      const properties = schema?.properties;
+      if (properties && typeof properties === 'object') {
+        const extra = Object.keys(parsed).filter(key => !Object.prototype.hasOwnProperty.call(properties, key));
+        if (extra.length) {
+          warnTool(`原生工具调用 ${call.name} 带有 schema 未声明的键（${extra.join(', ')}），照常发射`);
+        }
+      }
+    }
+    call.emittable = true;
+  };
+
+  const closeCall = (call, reason) => {
+    call.open = false;
+    call.closeReason = reason;
+    if (openCall === call) openCall = null;
+    judgeNativeCall(call);
+  };
+
+  const pushNativeSnapshot = (frame) => {
+    if (!frame || typeof frame !== 'object') return;
+    const name = typeof frame.name === 'string' ? frame.name : '';
+    const args = typeof frame.arguments === 'string' ? frame.arguments : '';
+    const phase = typeof frame.phase === 'string' ? frame.phase : null;
+    const functionId = typeof frame.functionId === 'string' && frame.functionId ? frame.functionId : null;
+
+    let splits = false;
+    if (openCall) {
+      splits = !!(
+        (functionId && openCall.functionId && functionId !== openCall.functionId) ||
+        (name && openCall.name && name !== openCall.name) ||
+        (isCompleteJson(openCall.arguments) && args !== openCall.arguments && !args.startsWith(openCall.arguments)) ||
+        (args === '' && openCall.arguments !== '')
+      );
+    }
+
+    if (!openCall || splits) {
+      // 本轮已关闭调用的逐字节副本：重复帧，丢弃，不开新的，也不关旧的。空快照不算副本
+      // （每个调用都以 '' 开头，它不是重复的证据）。
+      if (args !== '' && nativeCalls.some(call => !call.open && call.name === name && call.arguments === args)) return;
+      if (openCall) closeCall(openCall, 'split');
+      openCall = {
+        name, arguments: args, phase, functionId,
+        open: true, closeReason: null, resultSeen: false, emittable: false, emitted: false
+      };
+      nativeCalls.push(openCall);
+      return;
+    }
+
+    if (name && !openCall.name) openCall.name = name;
+    if (phase) openCall.phase = phase;
+    if (functionId && !openCall.functionId) openCall.functionId = functionId;
+    if (args.length < openCall.arguments.length && !isCompleteJson(openCall.arguments)) {
+      warnTool(`原生工具调用快照回退（snapshot_regression）：${openCall.name || '<unnamed>'} 收到更短且未配平的快照，保留较长的那份`);
+      return;
+    }
+    openCall.arguments = args;
+  };
+
+  // 结果帧按调用顺序到达，且可能晚于分裂关闭（SendMessage 先被 Bash 的开始关闭，它的
+  // 结果帧才来）：认领最早一个尚未被结果确认的同名调用（FIFO）；它若还打开着就顺带关闭。
+  const closeByName = (name) => {
+    if (typeof name !== 'string' || !name) return false;
+    const pending = nativeCalls.find(call => !call.resultSeen && call.name === name);
+    if (!pending) return false;
+    pending.resultSeen = true;
+    if (pending.open) closeCall(pending, 'result');
+    return true;
+  };
+
+  const closeOpen = (reason = 'boundary') => {
+    if (!openCall) return false;
+    closeCall(openCall, reason);
+    return true;
+  };
+
+  const takeCompleted = () => {
+    const out = [];
+    for (const call of nativeCalls) {
+      if (call.open || !call.emittable || call.emitted) continue;
+      call.emitted = true;
+      out.push(buildEmitted(call.name, call.arguments));
+    }
+    return out;
+  };
+
+  const batchState = () => {
+    const client = nativeCalls.filter(isClientCall);
+    return {
+      opened: client.length,
+      closedByResult: client.filter(call => call.resultSeen).length,
+      gated: client.filter(call => call.emittable).length
+    };
+  };
 
   const push = (deltas) => {
     if (!Array.isArray(deltas)) return;
@@ -1921,8 +2115,11 @@ const createNativeToolCallAccumulator = (options = {}) => {
     }
   };
 
+  // 单发：旧消费者只调一次；再调返回 []，不重记错误（以前每次调用都重新 push 错误）。
   const finalize = () => {
-    const finalized = [];
+    if (finalized) return [];
+    finalized = true;
+    const out = [];
     for (const [index, call] of [...calls.entries()].sort((a, b) => a[0] - b[0])) {
       if (!call.function.name) {
         errors.push({ type: 'missing_tool_name', index });
@@ -1938,23 +2135,25 @@ const createNativeToolCallAccumulator = (options = {}) => {
         errors.push({ type: 'invalid_arguments', name: call.function.name });
         continue;
       }
-      finalized.push({
-        index: finalized.length,
-        id: call.id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
-        type: 'function',
-        function: {
-          name: call.function.name,
-          arguments: call.function.arguments || '{}'
-        }
-      });
+      const emitted = buildEmitted(call.function.name, call.function.arguments || '{}');
+      if (call.id) emitted.id = call.id;
+      out.push(emitted);
     }
-    return finalized;
+    closeOpen('round_end');
+    out.push(...takeCompleted());
+    return out;
   };
 
   return {
     push,
+    pushNativeSnapshot,
+    closeByName,
+    closeOpen,
+    takeCompleted,
     finalize,
-    hasAny: () => calls.size > 0,
+    batchState,
+    hasOpenClientCalls: () => !!(openCall && isClientCall(openCall)),
+    hasAny: () => calls.size > 0 || nativeCalls.length > 0,
     hasParseError: () => errors.length > 0,
     getErrors: () => [...errors]
   };
@@ -1977,6 +2176,7 @@ module.exports = {
   isLeakedToolPayloadShape,
   matchToolCallOpening,
   normalizeAllowedToolNames,
+  ANSWER_PHASES,
   serializeToolArguments,
   // 控制字符修复导出仅供测试钉住"合法 JSON 是不动点"的不变式。
   escapeRawControlCharsInStrings,

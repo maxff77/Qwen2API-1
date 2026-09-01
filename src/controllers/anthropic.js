@@ -456,8 +456,12 @@ const describeToolErrors = (errors) => {
   const parts = [];
   if (unknown.length) parts.push(`unknown_tool: ${unknown.join(', ')}`);
   // salvage_rejected 单列：抢救闸门的拒绝正是 salvage-3 瞄准的类，诊断时
-  // 不能和真正的坏 JSON 混在一堆（review loop 1，条目 11）。
-  for (const type of ['invalid_json', 'truncated_tool_call', 'salvage_rejected']) {
+  // 不能和真正的坏 JSON 混在一堆（review loop 1，条目 11）。后四种来自原生累积器
+  // （createNativeToolCallAccumulator）——以前它们没被计入，日志只打 unspecified。
+  for (const type of [
+    'invalid_json', 'truncated_tool_call', 'salvage_rejected',
+    'invalid_arguments', 'missing_tool_name', 'truncated_native_call', 'schema_mismatch'
+  ]) {
     const count = errors.filter(e => e?.type === type).length;
     if (count) parts.push(`${type} ×${count}`);
   }
@@ -466,7 +470,8 @@ const describeToolErrors = (errors) => {
 
 /**
  * 工具错误的重试提示。基础文本复用 agent-turn.js 的通用提示；当错误是编造的工具名时，
- * 补上真实的名字 —— 那是让这类错误可恢复的唯一信息。
+ * 补上真实的名字 —— 那是让这类错误可恢复的唯一信息。原生调用的参数不合法
+ * （invalid_arguments / schema_mismatch）时，点名该工具：模型要重发的是参数，不是名字。
  * @param {Array<Object>} errors - 本轮的工具错误
  * @param {Array<string>} allowedToolNames - 本次请求真正提供的工具名
  * @returns {string} 提示文本
@@ -476,12 +481,20 @@ const buildToolErrorRetryHint = (errors, allowedToolNames) => {
   const unknown = [...new Set(
     errors.filter(e => e?.type === 'unknown_tool').map(e => e.name).filter(Boolean)
   )];
-  if (!unknown.length || !allowedToolNames?.length) return base;
-  return [
-    base,
-    `The tool name(s) ${unknown.join(', ')} do not exist.`,
-    `Use ONLY these exact tool names: ${allowedToolNames.join(', ')}.`
-  ].join('\n');
+  const badArguments = [...new Set(
+    errors.filter(e => e?.type === 'invalid_arguments' || e?.type === 'schema_mismatch').map(e => e.name).filter(Boolean)
+  )];
+  const lines = [base];
+  if (unknown.length && allowedToolNames?.length) {
+    lines.push(
+      `The tool name(s) ${unknown.join(', ')} do not exist.`,
+      `Use ONLY these exact tool names: ${allowedToolNames.join(', ')}.`
+    );
+  }
+  if (badArguments.length) {
+    lines.push(`Your arguments for tool ${badArguments.join(', ')} were not a valid JSON object or missed required keys. Re-emit the call with a complete JSON object that matches the tool's input schema.`);
+  }
+  return lines.join('\n');
 };
 
 /**
@@ -1770,5 +1783,7 @@ module.exports = {
   consumeUpstream,
   runWithAnthropicPing,
   handleAnthropicStream,
-  handleAnthropicNonStream
+  handleAnthropicNonStream,
+  describeToolErrors,
+  buildToolErrorRetryHint
 };
