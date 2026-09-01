@@ -987,15 +987,19 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     const normalized = normalizeDelta(delta);
     if (!normalized) return;
     if (nativeToolAccumulator && isProseResume(delta, normalized, rawPhase)) {
-      // 正文恢复关闭打开中的调用（过闸的随即发射）。批次已齐 —— 每个客户端调用都被
-      // 自己的结果帧关闭且至少一个过闸 —— 这一帧就是"工具不存在"叙述的开头：提前
-      // 终止上游，内容丢弃。批次不齐则永不早停，照旧消费到底。
+      // 正文恢复关闭打开中的调用（过闸的随即发射）。
       if (nativeToolAccumulator.closeOpen('boundary')) drainPromotedNativeCalls();
-      if (nativeBatchComplete(nativeToolAccumulator)) {
-        stopRequested = true;
-        logger.warn('Anthropic Agent 原生工具批次已晋升，提前终止上游（用量按本地估算）', 'ANTHROPIC');
-        return;
-      }
+    }
+    // 批次已齐 —— 每个客户端调用都被自己的结果帧关闭且至少一个过闸 —— 之后模型产出的
+    // 第一帧内容（思考**或**正文）就是"工具不存在"叙述的开头：提前终止上游，内容丢弃。
+    // 不能只等正文：生产里（2026-09-01 18:05）模型被拦截后先又思考了 54s 才开口，
+    // tool_use 早已在线上，等正文等于让客户端白等这 54s。批次不齐则永不早停，照旧
+    // 消费到底（保护迟到的并行调用 —— 它以 function_call 帧到达，没有内容，不会触发这里）。
+    if (nativeToolAccumulator && delta.role !== 'function' && normalized.content &&
+        nativeBatchComplete(nativeToolAccumulator)) {
+      stopRequested = true;
+      logger.warn('Anthropic Agent 原生工具批次已晋升，提前终止上游（用量按本地估算）', 'ANTHROPIC');
+      return;
     }
     delta.phase = normalized.phase;
     let content = normalized.content;
@@ -1498,14 +1502,15 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     const normalized = normalizeDelta(delta);
     if (!normalized) return;
     if (nativeToolAccumulator && isProseResume(delta, normalized, rawPhase)) {
-      // 与流式分支同一条：正文恢复关闭打开中的调用；批次已齐则这一帧是叙述的开头，
-      // 提前终止上游、内容丢弃。
+      // 与流式分支同一条：正文恢复关闭打开中的调用。
       if (nativeToolAccumulator.closeOpen('boundary')) drainPromotedNativeCalls();
-      if (nativeBatchComplete(nativeToolAccumulator)) {
-        stopRequested = true;
-        logger.warn('Anthropic 非流式 Agent 原生工具批次已晋升，提前终止上游（用量按本地估算）', 'ANTHROPIC');
-        return;
-      }
+    }
+    // 与流式分支同一条：批次已齐后第一帧内容（思考或正文）即叙述开头，提前终止上游。
+    if (nativeToolAccumulator && delta.role !== 'function' && normalized.content &&
+        nativeBatchComplete(nativeToolAccumulator)) {
+      stopRequested = true;
+      logger.warn('Anthropic 非流式 Agent 原生工具批次已晋升，提前终止上游（用量按本地估算）', 'ANTHROPIC');
+      return;
     }
     // 晋升之后的叙述（"工具不可用"）不进交付文本 —— 流式分支 tool_use 后抑制的孪生。
     if (promotedNativeCalls.length > 0) return;

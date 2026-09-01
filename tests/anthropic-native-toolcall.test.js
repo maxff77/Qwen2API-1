@@ -430,6 +430,52 @@ describe('native function_call promotion (stream): the capture-foreign incident'
     assert.ok(proseAt !== -1 && toolUseAt > proseAt, 'prose block precedes the tool_use blocks');
   });
 
+  it('thinking after parity (prod 18:05 shape): the FIRST think frame after the result frames stops the upstream', async () => {
+    // En produccion (2026-09-01 18:05:48) el modelo, tras la interceptacion, siguio PENSANDO 54s
+    // antes de emitir prosa. Con tool_use ya en el cable, esperar la prosa es hacer esperar al
+    // cliente esos 54s: la parada debe disparar en el primer frame con contenido, think o answer.
+    const sender = scriptedSender();
+    const thinkTail = [thinkFrame('The tools seem to be missing, let me reconsider...'), thinkFrame(' maybe I should report this.')];
+    const frames = [
+      ...nativeTurn('SendMessage', SEND_MESSAGE_SNAPSHOTS),
+      ...nativeTurn('Bash', BASH_SNAPSHOTS),
+      notExistsFrame('SendMessage'),
+      notExistsFrame('Bash'),
+      ...thinkTail,
+      ...NARRATION_FRAMES,
+      FINISHED_FRAME,
+      STOP
+    ];
+    const { served, stream } = recordingUpstream(frames);
+    const res = await runStream(() => stream, sender);
+
+    assertHeadlineWire(res, sender);
+    const firstThinkAt = frames.indexOf(thinkTail[0]);
+    assert.equal(served.length, firstThinkAt + 1, `must stop on the first think frame after parity, served ${served.length}`);
+    assert.equal(thinkingTextOf(res.output).includes('reconsider'), false, 'the post-parity thinking is discarded, not streamed');
+    assert.equal(res.output.includes(NARRATION_MARKER), false);
+  });
+
+  it('thinking BEFORE parity does not stop: a think frame between the call frames and their results is not narration', async () => {
+    const sender = scriptedSender();
+    const frames = [
+      ...nativeTurn('SendMessage', SEND_MESSAGE_SNAPSHOTS),
+      ...nativeTurn('Bash', BASH_SNAPSHOTS),
+      thinkFrame('waiting for the tools...'),
+      notExistsFrame('SendMessage'),
+      notExistsFrame('Bash'),
+      ...NARRATION_FRAMES,
+      FINISHED_FRAME,
+      STOP
+    ];
+    const { served, stream } = recordingUpstream(frames);
+    const res = await runStream(() => stream, sender);
+
+    assertHeadlineWire(res, sender);
+    const firstProseAt = frames.indexOf(NARRATION_FRAMES[0]);
+    assert.equal(served.length, firstProseAt + 1, 'parity is only reached after both result frames; the stop waits for them');
+  });
+
   it('post-tool-use suppression: result frames never arrive → no early stop, narration still stays off the wire', async () => {
     const sender = scriptedSender();
     const frames = [...nativeTurn('Bash', BASH_SNAPSHOTS), ...NARRATION_FRAMES, FINISHED_FRAME, STOP];
