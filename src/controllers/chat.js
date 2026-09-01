@@ -242,11 +242,12 @@ const normalizeAgentUsage = (attempt, requestBody, completionText) => {
     return usage
 }
 
-const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch) => {
+const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch, { suppressVisibleText = false } = {}) => {
     let reasoning = String(attempt?.reasoning || '')
     // 工具调用旁的正文照常交付（OpenAI 允许 content 与 tool_calls 并存）：严格门禁下文本
-    // 通道的调用到这里 visibleText 必为空白；原生晋升的回合带着调用前的正文过来。
-    const visibleText = String(attempt?.visibleText || '')
+    // 通道的调用到这里 visibleText 必为空白；原生晋升的回合带着调用前的正文过来 —— 除非
+    // 门禁判定那段正文混着写坏的文本 [TOOL CALL]（suppressVisibleText），那就一个字节不发。
+    const visibleText = suppressVisibleText ? '' : String(attempt?.visibleText || '')
     let content = attempt?.toolCalls?.length > 0 && !visibleText.trim() ? '' : visibleText
 
     if (attempt?.webSearchInfo) {
@@ -344,8 +345,8 @@ const handleOpenAIAgentStream = async (
         return
     }
 
-    const { attempt, finishReason } = runtime
-    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    const { attempt, finishReason, suppressVisibleText } = runtime
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText })
     let bufferedReasoning = output.reasoning
     const acceptedReasoningWasStreamed = liveReasoningByAttempt.has(runtime.attempts)
     const rawAcceptedReasoning = String(attempt.reasoning || '')
@@ -451,8 +452,8 @@ const handleOpenAIAgentNonStream = async (
     }
 
     setResponseHeaders(res, false)
-    const { attempt, finishReason } = runtime
-    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    const { attempt, finishReason, suppressVisibleText } = runtime
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText })
     const assistantMessage = {
         role: 'assistant',
         content: output.content || (attempt.toolCalls.length > 0 ? null : '')

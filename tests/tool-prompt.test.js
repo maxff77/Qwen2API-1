@@ -132,7 +132,9 @@ const BASH_SNAPSHOTS = [
 BASH_SNAPSHOTS.push(BASH_SNAPSHOTS[BASH_SNAPSHOTS.length - 1])
 const BASH_ARGS = BASH_SNAPSHOTS[BASH_SNAPSHOTS.length - 1]
 
-// Frame de plataforma (code_interpreter): phase propia + function_id round_N_call_<hex>.
+// Frame de plataforma (code_interpreter): phase propia + function_id round_N_call_<hex>. Forma y
+// function_id de OTRA captura (variante 'natural', frames #2-#12 — ver el header de
+// tests/anthropic-native-toolcall.test.js); la lista de snapshots esta abreviada, no es byte-fiel.
 const CODE_INTERPRETER_ID = 'round_0_call_45542fe59a8346bf888dd458'
 const CODE_INTERPRETER_SNAPSHOTS = ['', '{"code": "ls', '{"code": "ls -1 /tmp"}', '{"code": "ls -1 /tmp"}']
 
@@ -177,7 +179,10 @@ test('native accumulator twin: OpenAI deltas APPEND, Qwen snapshots REPLACE', ()
   assert.deepEqual(native.getErrors(), [])
 })
 
-test('native S2: un nombre distinto abre una segunda llamada (SendMessage → Bash)', () => {
+// Con los snapshots completos de la captura S2, S3 y S4 disparan a la vez (el Bash abre con ''
+// sobre un SendMessage ya JSON completo): este test pina el flujo entero, no un termino aislado.
+// Los terminos aislados van justo debajo (P1 S2, P2 S4, P6 S1; S3 en su propio test).
+test('native SendMessage → Bash con snapshots completos (S2/S3/S4 solapados): dos llamadas, tally y results', () => {
   const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['SendMessage', 'Bash'] })
   feedNative(accumulator, 'SendMessage', SEND_MESSAGE_SNAPSHOTS)
   feedNative(accumulator, 'Bash', BASH_SNAPSHOTS)
@@ -195,6 +200,60 @@ test('native S2: un nombre distinto abre una segunda llamada (SendMessage → Ba
   assert.equal(calls[1].function.arguments, BASH_ARGS)
   assert.deepEqual(calls.map(c => c.index), [0, 1])
   assert.deepEqual(accumulator.getErrors(), [])
+})
+
+// P1 — S2 AISLADO: el SendMessage abierto NO es JSON completo (S3 no aplica) y el Bash entra
+// con args no vacios (S4 no aplica), sin functionId (S1 no aplica). Solo el nombre distinto parte.
+test('native S2 aislado: nombre distinto sobre un snapshot incompleto → dos llamadas; la truncada es invalid_arguments', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['SendMessage', 'Bash'] })
+  accumulator.pushNativeSnapshot({ name: 'SendMessage', arguments: '{"to": ', phase: 'answer' })
+  accumulator.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "ls"}', phase: 'answer' })
+  assert.deepEqual(accumulator.batchState(), { opened: 2, closedByResult: 0, gated: 0 }, 'dos llamadas abiertas por S2')
+  assert.equal(accumulator.closeOpen('round_end'), true)
+  const calls = accumulator.takeCompleted()
+  assert.deepEqual(calls.map(c => [c.function.name, c.function.arguments]), [['Bash', '{"command": "ls"}']],
+    'sin S2 el Bash se fusionaria en el SendMessage y saldria SendMessage con los args de ls')
+  assert.deepEqual(accumulator.getErrors(), [{ type: 'invalid_arguments', name: 'SendMessage' }],
+    'el SendMessage cerrado por split con JSON incompleto es invalid_arguments (no truncated: no fue round_end)')
+})
+
+// P2 — S4 AISLADO: mismo nombre (S2 no), el abierto no es JSON completo (S3 no), sin functionId
+// (S1 no). Solo el '' entrante sobre args no vacios parte.
+test('native S4 aislado: "" sobre un snapshot incompleto del mismo nombre → parte; sin S4 seria snapshot_regression + truncated', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  accumulator.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "git st', phase: 'answer' })
+  accumulator.pushNativeSnapshot({ name: 'Bash', arguments: '', phase: 'answer' })
+  accumulator.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "ls"}', phase: 'answer' })
+  assert.equal(accumulator.closeOpen('round_end'), true)
+  const calls = accumulator.takeCompleted()
+  assert.deepEqual(calls.map(c => c.function.arguments), ['{"command": "ls"}'], 'la segunda llamada es la unica emitible')
+  assert.deepEqual(accumulator.getErrors(), [{ type: 'invalid_arguments', name: 'Bash' }])
+})
+
+// P6 — S1 AISLADO: mismo nombre (S2 no), abierto incompleto (S3 no), entrante no vacio (S4 no),
+// y el entrante NO es prefijo del abierto. Solo los functionId distintos parten.
+test('native S1 aislado: mismo nombre, dos function_id distintos, snapshots incompletos → dos llamadas (dos unknown_tool)', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash', 'code_interpreter'] })
+  accumulator.pushNativeSnapshot({ name: 'code_interpreter', arguments: '{"code": "ls', phase: 'code_interpreter', functionId: 'round_0_call_45542fe59a8346bf888dd458' })
+  accumulator.pushNativeSnapshot({ name: 'code_interpreter', arguments: '{"code": "pwd', phase: 'code_interpreter', functionId: 'round_0_call_12fea693a0114d33bea1aaad' })
+  assert.equal(accumulator.closeOpen('round_end'), true)
+  assert.deepEqual(accumulator.takeCompleted(), [])
+  assert.deepEqual(accumulator.getErrors(), [
+    { type: 'unknown_tool', name: 'code_interpreter' },
+    { type: 'unknown_tool', name: 'code_interpreter' }
+  ], 'sin S1 el segundo snapshot (mas largo) reemplazaria al primero y habria UNA llamada')
+})
+
+// P3 — function_id es el UNICO discriminador de plataforma: nombre en allowlist Y phase answer no
+// bastan para ser candidata cliente si el frame trae function_id.
+test('native P3: function_id presente + nombre permitido + phase answer → sigue siendo plataforma (unknown_tool, fuera del tally)', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['Bash'] })
+  accumulator.pushNativeSnapshot({ name: 'Bash', arguments: '{"command": "ls"}', phase: 'answer', functionId: 'round_0_call_deadbeef' })
+  assert.equal(accumulator.hasOpenClientCalls(), false)
+  assert.equal(accumulator.closeOpen('boundary'), true)
+  assert.deepEqual(accumulator.takeCompleted(), [], 'jamas emitible con function_id')
+  assert.deepEqual(accumulator.getErrors(), [{ type: 'unknown_tool', name: 'Bash' }])
+  assert.deepEqual(accumulator.batchState(), { opened: 0, closedByResult: 0, gated: 0 })
 })
 
 test('native S4: mismo nombre seguido, la segunda abre con "" → dos llamadas', () => {
@@ -221,6 +280,26 @@ test('native closeByName es FIFO: el primer result "Bash" confirma Bash#1 (cerra
   assert.deepEqual(accumulator.batchState(), { opened: 2, closedByResult: 2, gated: 2 })
   assert.equal(accumulator.closeByName('Bash'), false, 'un tercer result sin llamada pendiente no reclama nada')
   assert.deepEqual(accumulator.takeCompleted().map(c => c.function.arguments), [BASH_ARGS, '{"command": "ls"}'])
+})
+
+// F4: closeByName solo reclama candidatas CLIENTE. Si el cliente declara un tool que colisiona
+// con uno de plataforma (web_search), el FIFO sobre TODAS las llamadas dejaba que el result
+// frame confirmara la llamada de plataforma (function_id) y la del cliente jamas alcanzaba
+// paridad → sin corte temprano. Las de plataforma no necesitan result: cierran por split/boundary.
+test('native closeByName (F4): con nombre colisionado, el result confirma la llamada CLIENTE, no la de plataforma', () => {
+  const accumulator = createNativeToolCallAccumulator({ allowedToolNames: ['web_search'] })
+  accumulator.pushNativeSnapshot({ name: 'web_search', arguments: '{"query": "qwen"}', phase: 'web_search', functionId: 'round_0_call_0a1b2c3d4e5f60718293a4b5' })
+  accumulator.pushNativeSnapshot({ name: 'web_search', arguments: '', phase: 'answer' })
+  accumulator.pushNativeSnapshot({ name: 'web_search', arguments: '{"query": "lohari"}', phase: 'answer' })
+  assert.deepEqual(accumulator.batchState(), { opened: 1, closedByResult: 0, gated: 0 }, 'solo la cliente cuenta en el tally')
+
+  assert.equal(accumulator.closeByName('web_search'), true)
+  assert.deepEqual(accumulator.batchState(), { opened: 1, closedByResult: 1, gated: 1 }, 'el result reclama la llamada CLIENTE')
+  assert.equal(accumulator.hasOpenClientCalls(), false)
+  assert.deepEqual(accumulator.takeCompleted().map(c => c.function.arguments), ['{"query": "lohari"}'])
+  // Un segundo result por el mismo nombre no tiene cliente pendiente que reclamar.
+  assert.equal(accumulator.closeByName('web_search'), false)
+  assert.deepEqual(accumulator.getErrors(), [{ type: 'unknown_tool', name: 'web_search' }], 'la de plataforma se juzgo al cerrar por split')
 })
 
 test('native S3: snapshot abierto ya completo + entrante distinto que no lo extiende → nueva llamada', () => {
@@ -270,7 +349,10 @@ test('native platform-own: function_id presente → unknown_tool, jamas emitible
     }
     assert.equal(accumulator.hasAny(), true)
     assert.equal(accumulator.hasOpenClientCalls(), false, 'una llamada de plataforma no es cliente')
-    assert.equal(accumulator.closeByName('code_interpreter'), true)
+    // F4: el result frame por nombre no reclama llamadas de plataforma (ni siquiera con el
+    // nombre en la allowlist); cierran por boundary/round_end, como las conducen los controllers.
+    assert.equal(accumulator.closeByName('code_interpreter'), false)
+    assert.equal(accumulator.closeOpen('boundary'), true)
     assert.deepEqual(accumulator.takeCompleted(), [], `allowed=${allowed}`)
     assert.deepEqual(accumulator.getErrors(), [{ type: 'unknown_tool', name: 'code_interpreter' }])
     assert.deepEqual(accumulator.batchState(), { opened: 0, closedByResult: 0, gated: 0 })

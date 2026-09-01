@@ -2056,10 +2056,13 @@ const createNativeToolCallAccumulator = (options = {}) => {
   };
 
   // 结果帧按调用顺序到达，且可能晚于分裂关闭（SendMessage 先被 Bash 的开始关闭，它的
-  // 结果帧才来）：认领最早一个尚未被结果确认的同名调用（FIFO）；它若还打开着就顺带关闭。
+  // 结果帧才来）：认领最早一个尚未被结果确认的同名**客户端**调用（FIFO）；它若还打开着
+  // 就顺带关闭。平台调用不参与认领：客户端声明了与平台同名的工具（web_search）时，让
+  // 平台调用抢走结果帧会使客户端调用永远到不了配平、早停点不起来；平台调用本来就靠
+  // 分裂 / 边界 / 回合结束关闭，不需要结果帧。
   const closeByName = (name) => {
     if (typeof name !== 'string' || !name) return false;
-    const pending = nativeCalls.find(call => !call.resultSeen && call.name === name);
+    const pending = nativeCalls.find(call => isClientCall(call) && !call.resultSeen && call.name === name);
     if (!pending) return false;
     pending.resultSeen = true;
     if (pending.open) closeCall(pending, 'result');

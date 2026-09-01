@@ -7,6 +7,14 @@
 // tool_use al cerrarse, que la narracion jamas llega al cliente y que el upstream se
 // corta en cuanto el lote esta completo (paridad call/result + primera prosa).
 //
+// Los fixtures vienen de DOS capturas en vivo (probe 2026-09-01, qwen3.8-max, 181 cuentas):
+//   (a) scratchpad/capture-foreign.txt — variante 'foreign': llamadas del CLIENTE por la via
+//       nativa (nativeCallFrame, notExistsFrame, SEND_MESSAGE_*, BASH_*, NARRATION_*, FINISHED_FRAME).
+//   (b) variante 'natural' (think=0) — herramienta de PLATAFORMA code_interpreter
+//       (platformCallFrame, platformResultFrame, CODE_INTERPRETER_*, SANDBOX_*): frames #2-#12 y la
+//       narracion #39-#44. Archivo: /Users/pedro/.claude/projects/-Users-pedro-Documents-git-NextJS-lohari/
+//       b21b13fc-0999-448e-95a0-655753708faa/tool-results/toolu_01LhEfp5xqnsu4dHQ1ygQsPL.txt
+//
 // Set before anything pulls in config/index.js, which snapshots env at load.
 // node --test runs each file in its own process, so this cannot leak.
 // The config clamps this to [2, 6]; 3 keeps the cap-mutation tests short.
@@ -120,7 +128,7 @@ const scriptedSender = (...turns) => {
   return fn;
 };
 
-// ---- Fixtures byte-fieles a scratchpad/capture-foreign.txt (probe 2026-09-01, qwen3.8-max) ----
+// ---- Fixtures byte-fieles a la captura (a) scratchpad/capture-foreign.txt (variante 'foreign') ----
 // Frame de llamada del cliente: role assistant, content '', phase answer, status typing,
 // function_call {name, arguments}, extra.display_position answer, SIN function_id.
 const nativeCallFrame = (name, snapshot) => `data: ${JSON.stringify({
@@ -137,13 +145,16 @@ const nativeCallFrame = (name, snapshot) => `data: ${JSON.stringify({
   }]
 })}\n\n`;
 
-// Frame de herramienta de PLATAFORMA (code_interpreter): phase propia + function_id round_N_call_<hex>.
-const platformCallFrame = (name, snapshot, id) => `data: ${JSON.stringify({
+// ---- Fixtures byte-fieles a la captura (b) variante 'natural' (think=0), frames #2-#12 ----
+// Frame de herramienta de PLATAFORMA (code_interpreter, #2-#10): role assistant, content '',
+// phase propia (= nombre), status typing, function_call, function_id round_N_call_<hex>,
+// extra.display_position answer. `phase` se puede forzar (P3: function_id es el UNICO discriminador).
+const platformCallFrame = (name, snapshot, id, phase = name) => `data: ${JSON.stringify({
   choices: [{
     delta: {
       role: 'assistant',
       content: '',
-      phase: name,
+      phase,
       status: 'typing',
       function_call: { name, arguments: snapshot },
       function_id: id,
@@ -167,8 +178,11 @@ const notExistsFrame = (name) => `data: ${JSON.stringify({
   }]
 })}\n\n`;
 
-// Resultado de la herramienta de plataforma: status finished + extra.tool_result.
-const platformResultFrame = (name, id, toolResult) => `data: ${JSON.stringify({
+// Resultado de la herramienta de plataforma (#12): role function, content '', phase propia,
+// status finished, name, extra {function_id sin el prefijo round_N_, tool_result,
+// code_interpreter_info, display_position}, function_id. En #12 code_interpreter_info es
+// 'execute error' (distinto de tool_result); en #38 (segunda llamada) ambos coinciden.
+const platformResultFrame = (name, id, toolResult, codeInterpreterInfo = toolResult) => `data: ${JSON.stringify({
   choices: [{
     delta: {
       role: 'function',
@@ -179,7 +193,7 @@ const platformResultFrame = (name, id, toolResult) => `data: ${JSON.stringify({
       extra: {
         function_id: id.replace(/^round_\d+_/, ''),
         tool_result: toolResult,
-        code_interpreter_info: toolResult,
+        code_interpreter_info: codeInterpreterInfo,
         display_position: 'answer'
       },
       function_id: id
@@ -224,9 +238,23 @@ for (const prefix of BASH_PREFIXES) assert.ok(BASH_ARGS.startsWith(prefix), `cut
 const LS_ARGS = '{"command": "ls"}';
 const LS_SNAPSHOTS = ['', '{"command": ', LS_ARGS, LS_ARGS];
 
+// Captura (b), primera llamada: #2-#10 (9 frames, el final repetido), result #12. La ronda del
+// test comprime las dos llamadas de la captura en una: tras #12 el modelo reintento (#13-#38,
+// ok) y solo entonces narro #39-#44 ("There is **1** file in `/tmp`: `jail.log`").
 const CODE_INTERPRETER_ID = 'round_0_call_45542fe59a8346bf888dd458';
-const CODE_INTERPRETER_SNAPSHOTS = ['', '{"code": "ls', '{"code": "ls -1 /tmp"}', '{"code": "ls -1 /tmp"}'];
-const SANDBOX_RESULT = '```\nCount: 1\nFiles:\njail.log\n\n```';
+const CODE_INTERPRETER_SNAPSHOTS = [
+  '',
+  '{"code": "ls',
+  '{"code": "ls -1',
+  '{"code": "ls -1 /tmp | wc',
+  '{"code": "ls -1 /tmp | wc -l && ls',
+  '{"code": "ls -1 /tmp | wc -l && ls -1 /tmp',
+  '{"code": "ls -1 /tmp | wc -l && ls -1 /tmp"',
+  '{"code": "ls -1 /tmp | wc -l && ls -1 /tmp"}',
+  '{"code": "ls -1 /tmp | wc -l && ls -1 /tmp"}'
+];
+const SANDBOX_RESULT = '```\n  Cell In[2], line 1\n    ls -1 /tmp | wc -l && ls -1 /tmp\n                        ^\nSyntaxError: invalid syntax\n\n```';
+const SANDBOX_INFO = 'execute error';
 
 const nativeTurn = (name, snapshots) => snapshots.map(snapshot => nativeCallFrame(name, snapshot));
 
@@ -476,6 +504,27 @@ describe('native function_call promotion (stream): the capture-foreign incident'
     assert.equal(served.length, firstProseAt + 1, 'parity is only reached after both result frames; the stop waits for them');
   });
 
+  it('F3: the post-tool-use suppression is scoped to NATIVE promotions — prose after a text-channel [TOOL CALL] still reaches the wire', async () => {
+    // main (dc2e8ec) delivered prose + thinking after a text-channel call on the stream path,
+    // and the non-stream twin (`if (promotedNativeCalls.length > 0) return`) gates on native
+    // promotions only. Setting the flag inside emitToolUse for EVERY tool_use silently dropped
+    // both on stream. The flag belongs to drainPromotedNativeCalls.
+    const sender = scriptedSender();
+    const res = await runStream(turnOf(
+      answerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"git status"}}[END TOOL CALL]'),
+      answerFrame('Here is what I found: all clean.'),
+      thinkFrame('more thought'),
+      FINISHED_FRAME
+    ), sender);
+
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(toolUseNames(res.output), ['Bash']);
+    assert.equal(visibleTextOf(res.output), 'Here is what I found: all clean.', 'prose after a TEXT call is not narration echo');
+    assert.equal(thinkingTextOf(res.output), 'more thought', 'thinking after a TEXT call is delivered too');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
   it('post-tool-use suppression: result frames never arrive → no early stop, narration still stays off the wire', async () => {
     const sender = scriptedSender();
     const frames = [...nativeTurn('Bash', BASH_SNAPSHOTS), ...NARRATION_FRAMES, FINISHED_FRAME, STOP];
@@ -524,6 +573,35 @@ describe('native promotion (stream): same-name calls, duplicates and reopen', ()
     assert.equal(sender.calls.length, 0);
     assert.deepEqual(toolUsesOf(res.output).map(u => u.args), [BASH_ARGS]);
     assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('P8: a SAME-channel byte-identical duplicate (second native Bash restarting from "") is dropped by the ledger — deliberate narrowing', async () => {
+    // The plan scoped the ledger to CROSS-channel copies; keeping it global is deliberate and
+    // errs on the safe side. Two native calls with identical name + args in one round are far
+    // likelier the platform re-sending the batch than the model wanting the same side effect
+    // twice; a missed second execution is recoverable (the model re-asks), a doubled `rm` is
+    // not. Pinned so nobody "fixes" this into a double execution by accident.
+    const sender = scriptedSender();
+    let res;
+    const warns = await captureWarns(async () => {
+      res = await runStream(turnOf(
+        ...nativeTurn('Bash', BASH_SNAPSHOTS),
+        notExistsFrame('Bash'),
+        ...nativeTurn('Bash', BASH_SNAPSHOTS),
+        notExistsFrame('Bash'),
+        ...NARRATION_FRAMES,
+        FINISHED_FRAME
+      ), sender);
+    });
+
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(toolUsesOf(res.output).map(u => u.args), [BASH_ARGS], 'exactly ONE tool_use');
+    assert.ok(
+      warns.some(line => /重复的工具调用/.test(line) && /Bash/.test(line)),
+      `expected the dedupe warn, got:\n${warns.join('\n')}`
+    );
+    assert.doesNotMatch(res.output, /"type":"error"/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
   });
 
   it('cross-channel dedupe: a text [TOOL CALL] Bash plus the native Bash with the same args → ONE tool_use', async () => {
@@ -576,7 +654,7 @@ describe('native promotion (stream): gates and platform tools keep today\'s cont
     const sender = scriptedSender(turnOf(answerFrame('Done.')));
     const frames = [
       ...CODE_INTERPRETER_SNAPSHOTS.map(s => platformCallFrame('code_interpreter', s, CODE_INTERPRETER_ID)),
-      platformResultFrame('code_interpreter', CODE_INTERPRETER_ID, SANDBOX_RESULT),
+      platformResultFrame('code_interpreter', CODE_INTERPRETER_ID, SANDBOX_RESULT, SANDBOX_INFO),
       answerFrame('There'), answerFrame(' is **1**'), answerFrame(' file in `/tmp'), answerFrame('`:\n\n*'),
       answerFrame('   `jail'), answerFrame('.log`'),
       FINISHED_FRAME,
@@ -591,6 +669,51 @@ describe('native promotion (stream): gates and platform tools keep today\'s cont
     assert.equal(sender.calls.length, 1, 'unknown_tool: code_interpreter → one suppressed tool_error retry');
     assert.match(JSON.stringify(sender.calls[0]), /Use ONLY these exact tool names: Bash/);
     assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('P3: function_id is the ONLY discriminator — platform frames with phase "answer" and an allowlisted name stay platform (no tool_use, no early stop)', async () => {
+    // Name matching is not a discriminator (a client may declare a tool literally named like a
+    // platform one) and neither is the phase alone: a frame carrying function_id is platform-own.
+    const sender = scriptedSender(turnOf(answerFrame('Done.')));
+    const frames = [
+      ...CODE_INTERPRETER_SNAPSHOTS.map(s => platformCallFrame('code_interpreter', s, CODE_INTERPRETER_ID, 'answer')),
+      platformResultFrame('code_interpreter', CODE_INTERPRETER_ID, SANDBOX_RESULT, SANDBOX_INFO),
+      ...NARRATION_FRAMES,
+      FINISHED_FRAME,
+      STOP
+    ];
+    const { served, stream } = recordingUpstream(frames);
+    const res = await runStream(() => stream, sender, { allowedToolNames: ['code_interpreter', 'Bash'], toolSchemas: {} });
+
+    assert.deepEqual(toolUseNames(res.output), [], 'a function_id frame is never a client candidate, whatever its phase or name');
+    assert.equal(served.length, frames.length, 'platform calls never reach parity: no early stop');
+    assert.equal(sender.calls.length, 1, 'unknown_tool → one tool_error retry, as today');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('P7: partially gated batch — Bash#1 promoted, Bash#2 schema_mismatch → one tool_use, one provenance warn, zero retries, no error event', async () => {
+    const sender = scriptedSender();
+    let res;
+    const warns = await captureWarns(async () => {
+      res = await runStream(turnOf(
+        ...nativeTurn('Bash', ['', '{"command": ', '{"command": "git status"}', '{"command": "git status"}']),
+        ...nativeTurn('Bash', ['', '{"description": ', '{"description": "no command"}', '{"description": "no command"}']),
+        notExistsFrame('Bash'),
+        notExistsFrame('Bash'),
+        ...NARRATION_FRAMES,
+        FINISHED_FRAME
+      ), sender);
+    });
+
+    assert.equal(sender.calls.length, 0, 'an emitted tool_use settles the round: the sibling schema_mismatch fires no retry');
+    assert.deepEqual(toolUsesOf(res.output).map(u => [u.name, u.args]), [['Bash', '{"command": "git status"}']]);
+    assert.equal(
+      warns.filter(line => /原生工具调用晋升/.test(line)).length, 1,
+      `exactly one provenance line (only #1 gated), got:\n${warns.join('\n')}`
+    );
+    assert.doesNotMatch(res.output, /"type":"error"/);
+    assert.equal(res.output.includes(NARRATION_MARKER), false);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
   });
 
   it('think-phase native frames (no function_id) are evidence, not promotion → thought_tool_call retry', async () => {
@@ -684,6 +807,21 @@ describe('native promotion (non-stream twin)', () => {
     assert.equal(JSON.stringify(res.body).includes(NARRATION_MARKER), false);
     const firstProseAt = FOREIGN_TURN_FRAMES.indexOf(NARRATION_FRAMES[0]);
     assert.equal(served.length, firstProseAt + 1, 'non-stream stops early too');
+  });
+
+  it('P4: narration guard — no result frame, narration after the native call → content is ONLY the tool_use, zero narration bytes', async () => {
+    // Twin of the stream's post-tool-use suppression: `if (promotedNativeCalls.length > 0) return`.
+    // Without a result frame there is no parity and no early stop, so every narration frame is
+    // consumed — and must still be dropped from answerContent.
+    const sender = scriptedSender();
+    const res = await runNonStream(turnOf(...nativeTurn('Bash', BASH_SNAPSHOTS), ...NARRATION_FRAMES, FINISHED_FRAME), sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual((res.body?.content || []).map(b => b.type), ['tool_use']);
+    assert.deepEqual(res.body.content[0].input, JSON.parse(BASH_ARGS));
+    assert.equal(JSON.stringify(res.body).includes(NARRATION_MARKER), false, 'narration after a promotion never reaches the body');
+    assert.equal(res.body.stop_reason, 'tool_use');
   });
 
   it('cross-channel dedupe replaces the concat: text Bash + native Bash same args → one tool_use', async () => {
@@ -788,5 +926,35 @@ describe('production wiring: /v1/messages tools[].input_schema → toolSchemas �
     assert.equal(res.statusCode, 502);
     assert.equal(res.body?.error?.type, 'invalid_tool_call_error');
     assert.match(res.body?.error?.message || '', /schema_mismatch/);
+  });
+
+  it('P9: end-to-end invalid_arguments — a native round whose final snapshot is a JSON array converges to a 502 naming invalid_arguments', async () => {
+    // Mirrors the truncated_native_call (stream) and schema_mismatch (non-stream) pins: the
+    // shape check (plain object only) must surface by name in the client-facing error.
+    const nonObject = [
+      nativeCallFrame('Bash', ''),
+      nativeCallFrame('Bash', '[1]'),
+      nativeCallFrame('Bash', '[1]'),
+      notExistsFrame('Bash'),
+      FINISHED_FRAME,
+      STOP
+    ];
+    e2eUpstreamFactory = () => Readable.from(nonObject);
+    const req = {
+      body: {
+        model: 'qwen3-coder-plus',
+        max_tokens: 512,
+        stream: false,
+        messages: [{ role: 'user', content: 'check git status' }],
+        tools: [BASH_TOOL]
+      }
+    };
+    const res = createMockJsonResponse();
+    await handleAnthropicMessages(req, res);
+
+    assert.deepEqual((res.body?.content || []).filter(b => b.type === 'tool_use'), [], 'a non-object payload must never gate through');
+    assert.equal(res.statusCode, 502);
+    assert.equal(res.body?.error?.type, 'invalid_tool_call_error');
+    assert.match(res.body?.error?.message || '', /invalid_arguments/);
   });
 });

@@ -297,15 +297,19 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
 
     if (!normalized) return
     if (nativeTools && isProseResume(delta, normalized, rawPhase)) {
-      // 正文恢复关闭打开中的调用（过闸的随即晋升）。批次已齐 —— 每个客户端调用都被自己的
-      // 结果帧关闭且至少一个过闸 —— 这一帧就是"工具不存在"叙述的开头：提前终止上游，
-      // 内容丢弃。批次不齐则永不早停，照旧消费到底。
+      // 正文恢复关闭打开中的调用（过闸的随即晋升）。
       if (nativeTools.closeOpen('boundary')) drainPromotedNativeCalls()
-      if (nativeBatchComplete(nativeTools)) {
-        stopRequested = true
-        logger.warn('OpenAI Agent 原生工具批次已晋升，提前终止上游（用量按本地估算）', 'AGENT')
-        return
-      }
+    }
+    // 批次已齐 —— 每个客户端调用都被自己的结果帧关闭且至少一个过闸 —— 之后模型产出的
+    // 第一帧内容（思考**或**正文）就是"工具不存在"叙述的开头：提前终止上游，内容丢弃。
+    // 与 anthropic.js 同一条：不能只等正文 —— 生产里（2026-09-01 18:05）模型被拦截后先又
+    // 思考了 54s 才开口。批次不齐则永不早停，照旧消费到底（迟到的并行调用以 function_call
+    // 帧到达，没有内容，不会触发这里）。
+    if (nativeTools && delta.role !== 'function' && normalized.content &&
+        nativeBatchComplete(nativeTools)) {
+      stopRequested = true
+      logger.warn('OpenAI Agent 原生工具批次已晋升，提前终止上游（用量按本地估算）', 'AGENT')
+      return
     }
     // 晋升之后的叙述（"工具不可用"）不进 answer/reasoning —— 调用前的正文已经在 answer 里了。
     if (promotedNativeCalls.length > 0) return
@@ -359,11 +363,21 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     reasoningTools.errors.length === 0
     ? reasoningTools.toolCalls
     : []
-  // 原生在前（它先关闭），文本通道其次；同名同参数的后到副本按登记簿丢弃，再统一编号。
+  // 原生优先（本运行时改动前的语义：`nativeToolCalls.length > 0 ? nativeToolCalls : 文本`）：
+  // 有一个过闸的原生调用，本轮文本通道的调用整体丢弃 —— 两个通道合并会让一条写坏/顺手写的
+  // 文本 [TOOL CALL] 与结构化的原生调用一起执行。这里整轮都在缓冲，丢得掉（anthropic.js
+  // 的文本调用是内联发射的，收不回来）。登记簿仍管其余的同名同参数副本，再统一编号。
+  const textChannelCalls = textTools.toolCalls.length > 0 ? textTools.toolCalls : standaloneReasoningCalls
+  if (nativeToolCalls.length > 0 && textChannelCalls.length > 0) {
+    logger.warn(
+      `OpenAI Agent 本轮原生工具调用优先，丢弃文本通道的 ${textChannelCalls.length} 个调用（${textChannelCalls.map(call => call.function.name).join(', ')}）`,
+      'AGENT'
+    )
+  }
   const admitToolCall = createToolCallLedger()
   const toolCalls = [
     ...nativeToolCalls,
-    ...(textTools.toolCalls.length > 0 ? textTools.toolCalls : standaloneReasoningCalls)
+    ...(nativeToolCalls.length > 0 ? [] : textChannelCalls)
   ]
     .filter(call => {
       if (admitToolCall(call)) return true
@@ -371,11 +385,16 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
       return false
     })
     .map((call, index) => ({ ...call, index }))
-  const toolErrors = [
+  // 文本来源与原生来源分开记：原生接纳时，文本来源的错误意味着 visibleText 里混着写坏的
+  // [TOOL CALL]（evaluate 据此把正文置空）；原生来源的（平台调用的 unknown_tool 之类）不算。
+  const textToolErrors = [
     ...(textTools.errors || []),
     ...(textTools.toolCalls.length === 0 && !textTools.cleanedText.trim()
       ? (reasoningTools.errors || [])
-      : []),
+      : [])
+  ]
+  const toolErrors = [
+    ...textToolErrors,
     ...(nativeTools?.getErrors?.() || [])
   ]
   const control = parseAgentControlText(textTools.cleanedText)
@@ -397,6 +416,7 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     streamedControlState: controlStreamParser?.getState?.() || null,
     toolCalls,
     toolErrors,
+    textToolErrors,
     // 本轮过闸晋升的 Qwen 原生 function_call（已并入 toolCalls）。门禁凭它在 toolErrors
     // 否决与"正文不得与工具并存"之前接纳本轮。
     nativeToolCalls: promotedNativeCalls,
@@ -429,9 +449,14 @@ const evaluateOpenAIAgentAttempt = (attempt, options = {}) => {
   }
   // 过闸的原生调用是结构化帧，比文本启发式更强的证据：有一个就接纳本轮 —— 排在
   // toolErrors 否决与"正文不得与工具并存"之前，不翻 agentTurnAllowProseWithTools。
-  // 调用前的正文随 visibleText 交付；调用后的叙述在采集时就已丢弃。
+  // 调用前的干净正文随 visibleText 交付；调用后的叙述在采集时就已丢弃。但被跳过的两道
+  // 否决恰恰说明 visibleText 里可能混着写坏的文本 [TOOL CALL]（文本来源的解析错误 /
+  // 孤儿协议残渣）：这种正文不交付 —— suppressVisibleText 让交付层把 content 置空，
+  // tool_calls 照常。
   if ((attempt.nativeToolCalls?.length || 0) > 0) {
-    return { accepted: true, finishReason: 'tool_calls', retryReason: null }
+    const suppressVisibleText = (attempt.textToolErrors?.length || 0) > 0 ||
+      containsOrphanProtocolResidue(attempt.visibleText)
+    return { accepted: true, finishReason: 'tool_calls', retryReason: null, suppressVisibleText }
   }
   if (attempt.toolErrors.length > 0) {
     return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call' }
@@ -593,11 +618,16 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
           kind: attempt.streamedControlKind
         })
       }
+      if (evaluation.suppressVisibleText) {
+        logger.warn('OpenAI Agent 原生接纳的回合正文带文本工具错误/协议残渣，content 置空只交付 tool_calls', 'AGENT')
+      }
       return {
         ok: true,
         attempt,
         finishReason: evaluation.finishReason,
-        attempts: attemptNumber
+        attempts: attemptNumber,
+        // 原生接纳但正文被文本 [TOOL CALL] 残渣污染：交付层不转发 visibleText。
+        suppressVisibleText: evaluation.suppressVisibleText === true
       }
     }
 

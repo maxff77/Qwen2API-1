@@ -761,9 +761,11 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   // malformed_protocol 与 think 晋升守卫的输入），不写任何字节到线上；tool_use
   // 照常放行。由构造只可能在最后一轮为真：名额一次性，任何再拒绝都直接 break。
   let suppressAttemptOutput = false;
-  // 原生晋升（D2）：本轮一旦有 tool_use 上线，其后的文本/思考增量只做记账、不上线 ——
-  // 结果帧不到、早停（D3）点不起来时的那条保险带。按轮复位（startAttempt），与
-  // suppressAttemptOutput 互不干扰：那个由抑制重试跨轮持有到最后一轮。
+  // 原生晋升（D2）：本轮一旦有**原生**调用晋升，其后的文本/思考增量只做记账、不上线 ——
+  // 结果帧不到、早停（D3）点不起来时的那条保险带。只对原生晋升置位（与非流式的
+  // `promotedNativeCalls.length > 0` 守卫同源）：文本通道调用之后的正文是模型自己的话，
+  // main 一直照常交付，不能一并吞掉。按轮复位（startAttempt），与 suppressAttemptOutput
+  // 互不干扰：那个由抑制重试跨轮持有到最后一轮。
   let suppressPostToolUseOutput = false;
   // 本轮跨通道去重登记簿；"已发射 tool_use"由 emitToolUse 自己置位，回合收尾不再重算。
   let admitToolCall = null;
@@ -902,7 +904,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 
   /**
    * 输出一个完整的 tool_use 块（按 input_json_delta 切片）。跨通道副本在这里丢弃；
-   * 发射即置位 hasEmittedToolCalls，并让本轮其后的文本/思考只记账不上线。
+   * 发射即置位 hasEmittedToolCalls。tool_use 之后的输出抑制不在这里：只有原生晋升
+   * 才置位（drainPromotedNativeCalls）。
    * @param {Object} call - 工具调用
    */
   const emitToolUse = (call) => {
@@ -914,7 +917,6 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       return;
     }
     hasEmittedToolCalls = true;
-    suppressPostToolUseOutput = true;
     closeThinkingBlockIfOpen();
     closeTextBlockIfOpen();
     blockIndex += 1;
@@ -941,6 +943,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   /**
    * 关闭即发射：排出累积器里已关闭、过闸、尚未发射的原生调用。幂等，每次可能关闭之后
    * 都调一次。每个晋升留一行来源日志（名字、phase、无 function_id —— 绝不打参数）。
+   * 原生晋升之后本轮的文本/思考只记账不上线（平台"工具不存在"注入的回声）—— 在这里
+   * 置位而不是 emitToolUse：文本通道的调用之后的正文照常交付。副本被登记簿丢弃时也
+   * 置位：那份调用已经在线上（与非流式 promotedNativeCalls 的守卫一致）。
    */
   const drainPromotedNativeCalls = () => {
     for (const call of nativeToolAccumulator.takeCompleted()) {
@@ -950,6 +955,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       );
       // 早停的回合收不到上游尾部的 usage 帧，本地估算要吃到参数 JSON 才不至于 ~0。
       completionContent += call.function.arguments;
+      suppressPostToolUseOutput = true;
       emitToolUse(call);
     }
   };
