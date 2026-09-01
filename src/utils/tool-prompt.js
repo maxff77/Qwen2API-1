@@ -1432,6 +1432,12 @@ const parseToolCallsFromText = (fullText, options = {}) => {
     //
     // 不产生调用，但整段仍然**吞掉**：它是工具标记，不是回答。放回正文会让裸 XML 漏给
     // 客户端 —— 模型在 thinking 里写 `checking <tool_call>{…}</tool_call>` 正是这一种。
+    //
+    // 原生通道（delta.function_call → createNativeToolCallAccumulator，anthropic.js 喂入）
+    // 刻意**不**受这道位置门约束，正文之后到达的原生调用照样晋升（决议 2026-09-01）。
+    // 理由如实记：结构化帧是比文本启发式更强的证据 —— 但不是"不可伪造"。已接受的风险：
+    // 平台原生解析器的哨兵对我们不透明，回显的文本能否点燃它无法证明；每次晋升按调用
+    // 留一行来源日志，就是那一天的审计线索。
     if (emittedProse) {
       warnings.push({
         type: 'triggered_unrecovered',
