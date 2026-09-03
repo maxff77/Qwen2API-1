@@ -3,6 +3,7 @@ const { isChatType, isThinkingEnabled, parserModel, parserMessages } = require('
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
 const { buildAgentTurnDirective } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
+const { mapIncomingModel } = require('../utils/model-map.js')
 
 const shouldEnableToolRuntime = (tools, chatType, toolChoice) => (
   Array.isArray(tools) &&
@@ -54,6 +55,9 @@ const processRequestBody = async (req, res, next) => {
       tools,                // 工具列表（OpenAI function calling）
       tool_choice           // 工具调用控制
     } = req.body
+
+    // 先做 MODEL_MAP 映射，再判定 thinking / chat_type：目标 id 的 -thinking 后缀要照常生效
+    model = await mapIncomingModel(model)
 
     const now = Math.floor(Date.now() / 1000)
     const fid = generateUUID()

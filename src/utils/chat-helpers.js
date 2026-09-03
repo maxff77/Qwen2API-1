@@ -16,9 +16,6 @@ const MODEL_SUFFIXES = [
     '-image'
 ]
 
-// ponytail: no hardcoded claude→qwen mapping. Users set model in Claude Code config directly.
-// Non-claude names pass through to upstream via existing parserModel lookup.
-
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
 

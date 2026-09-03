@@ -21,6 +21,7 @@ const {
 } = require('../utils/tool-prompt.js');
 const { createAgentTagStripper, stripAgentTags, buildAgentRetryHint, buildAgentTurnDirective } = require('../utils/agent-turn.js');
 const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.js');
+const { mapIncomingModel } = require('../utils/model-map.js');
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
 const { logger } = require('../utils/logger');
 const { assertNoUpstreamFailure } = require('../utils/upstream-error.js');
@@ -223,7 +224,9 @@ const flattenAnthropicMessages = (messages) => {
  * @returns {Promise<{body: Object, hasTools: boolean, toolChoice: any, allowedToolNames: string[], enable_thinking: boolean, model: string}>} 转换结果
  */
 const buildInternalRequest = async (anthropicReq) => {
-  const { model, messages, system, tools, tool_choice, stream, thinking } = anthropicReq;
+  const { messages, system, tools, tool_choice, stream, thinking } = anthropicReq;
+  // 先做 MODEL_MAP 映射，再判定 thinking / chat_type：目标 id 的 -thinking 后缀要照常生效
+  const model = await mapIncomingModel(anthropicReq.model);
 
   const normalizedTools = normalizeAnthropicTools(tools);
   const internalToolChoice = normalizeAnthropicToolChoice(tool_choice);
