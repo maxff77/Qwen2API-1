@@ -135,6 +135,7 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `OUTPUT_THINK` | 是否显示 AI 思考过程 | `true` 或 `false` |
 | `LEGACY_REASONING_IN_CONTENT` | 推理输出格式。默认 `false`=推理走独立的 `reasoning_content` 字段；`true`=旧版行为（`<think>` 并入 `content`） | `true` 或 `false` |
 | `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
+| `MODEL_MAP` | 入站模型名映射：`alias=qwen-id,...,*=fallback`。精确匹配优先（末尾 `[..]` 先去掉、不区分大小写），上游已有的 Qwen id 原样透传，其余走 `*`；只作用于 `/v1/chat/completions` 与 `/v1/messages`，详见 `.env.example` | `*=qwen3.8-max-thinking` |
 | `MODELS_CACHE_TTL` | 模型列表缓存有效期（秒），过期后下次请求自动向上游刷新；`0` 表示永不过期 | `3600` |
 | `AGENT_TURN_ALLOW_PROSE_WITH_TOOLS` | 放宽回合门禁：允许同一回合既有有效工具调用又有可见正文。Anthropic Messages API 允许 `text` 与 `tool_use` 共存，Claude Code 等客户端因此会被严格模式反复判为 `invalid_tool_call` | `false` |
 | `AGENT_TURN_ACCEPT_BARE_FINAL` | 放宽回合门禁：把有可见正文但缺少 `<agent_final>` 包装的回合按 `finish_reason=stop` 接受，而不是判为 `bare` 并重试 | `false` |

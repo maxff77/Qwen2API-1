@@ -5,16 +5,7 @@ const { uploadFileToQwenOss } = require('./upload.js')
 const { getLatestModels } = require('../models/models-map.js')
 const accountManager = require('./account.js')
 const CacheManager = require('./img-caches.js')
-
-const MODEL_SUFFIXES = [
-    '-thinking-search',
-    '-image-edit',
-    '-deep-research',
-    '-thinking',
-    '-search',
-    '-video',
-    '-image'
-]
+const { MODEL_SUFFIXES } = require('./model-suffixes.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
