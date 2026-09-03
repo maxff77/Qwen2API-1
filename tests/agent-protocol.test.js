@@ -1316,6 +1316,10 @@ const AGENT_LEAK = [
   '[END TOOL CALL]',
   '[END TOOL CALL]'
 ].join('\n')
+// El mismo payload SIN closer: residuo (forma de leak) pero no protocolo demostrable →
+// sigue disparando malformed_protocol. Desde el spec narrated-toolcall (2026-09-02) la
+// forma CON closer y nombre no declarado es un error duro (unknown_tool → invalid_tool_call).
+const AGENT_LEAK_NO_CLOSER = AGENT_LEAK.split('\n')[0]
 
 const runAgentTurn = (initialFrames, sendChatRequest, overrides = {}) => runOpenAIAgentTurn(
   agentTurnStream(...initialFrames),
@@ -1410,7 +1414,23 @@ test('OpenAI loop: la segunda interceptacion entrega el final envuelto tal cual 
   assert.match(result.attempt.visibleText, /unavailable/)
 })
 
-test('OpenAI loop: el leak malformado reintenta con su hint y recupera tool_calls', async () => {
+test('OpenAI loop: el leak malformado (sin closer) reintenta con su hint y recupera tool_calls', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentAnswerFrame(AGENT_LEAK_NO_CLOSER)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    }
+  )
+
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(sent.length, 1)
+  assert.match(JSON.stringify(sent[0]), /was NOT executed/)
+})
+
+test('OpenAI loop: el leak CON closer y nombre no declarado es error duro (spec narrated-toolcall) → invalid_tool_call, reintenta y recupera', async () => {
   const sent = []
   const result = await runAgentTurn(
     [agentAnswerFrame(AGENT_LEAK)],
@@ -1423,7 +1443,9 @@ test('OpenAI loop: el leak malformado reintenta con su hint y recupera tool_call
   assert.equal(result.ok, true)
   assert.equal(result.finishReason, 'tool_calls')
   assert.equal(sent.length, 1)
-  assert.match(JSON.stringify(sent[0]), /was NOT executed/)
+  const hint = JSON.stringify(sent[0])
+  assert.match(hint, /invalid, truncated, or unknown tool call/, 'la razon es invalid_tool_call (unknown_tool), no malformed_protocol')
+  assert.doesNotMatch(hint, /was NOT executed/)
 })
 
 test('OpenAI loop: required_tool tapa la interceptacion pero el hint lleva el dato clave', async () => {
@@ -1518,7 +1540,7 @@ test('P10: drops de tools internos en la ruta OpenAI no disparan intercepted', a
 test('P10: los drops internos no queman el slot que malformed_protocol necesita', async () => {
   const sent = []
   const result = await runAgentTurn(
-    [agentInterceptionFrame('web_search'), agentAnswerFrame(AGENT_LEAK)],
+    [agentInterceptionFrame('web_search'), agentAnswerFrame(AGENT_LEAK_NO_CLOSER)],
     async (body) => {
       sent.push(body)
       return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
