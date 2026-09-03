@@ -8,6 +8,8 @@ const UNMAPPED_CAP = 100
 // 记录或打日志前先截断：请求体上限 128 MB（src/server.js），
 // 不能让客户端把超长串留在内存里，也不能让换行混进日志行。
 const NAME_MAX_LENGTH = 200
+// dashboard 一次最多提交的映射行数
+const MODEL_MAP_MAX_ROWS = 200
 const unmappedModels = new Set()
 let capWarned = false
 let upstreamUnavailableWarned = false
@@ -70,6 +72,80 @@ const isKnownUpstreamModel = (name, models) => {
     ))
 }
 
+// 出现在 alias / target 里会破坏 MODEL_MAP 原文的往返解析（* 只允许作为回退行）
+const RESERVED_ALIAS_CHARS = /[,=*]/
+const RESERVED_TARGET_CHARS = /[,=]/
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\x00-\x1f\x7f]/
+
+const asString = (value) => (typeof value === 'string' ? value : '')
+
+/**
+ * 纯函数：把 dashboard 的行 + 回退目标拼成 MODEL_MAP 原文，逐项校验。
+ * alias：trim → 去 [..] → 小写；1..NAME_MAX_LENGTH 字符；不含 , = * 和控制字符；规范化后不得重复。
+ * target 与非空 fallback：trim 后必须通过 isKnownUpstreamModel（允许 -thinking 等真实后缀）。
+ * 上游列表为空时无法校验目标：报一条 field='upstream' 的错误，不逐行报。
+ * 永不抛错；有任何错误时 raw 为 ''。空输入 → raw ''。
+ * @param {Array<{alias: string, target: string}>} entries - 行
+ * @param {string} fallback - '*' 的目标，空串表示不设置
+ * @param {Array} upstreamModels - 上游模型列表（/api/models 的 data）
+ * @returns {{ raw: string, errors: Array<{ index: number|null, field: string, value: string, message: string }> }}
+ */
+const buildModelMap = (entries, fallback, upstreamModels) => {
+    const errors = []
+    // 回显的 value 一律截断：请求体可以很大，错误响应和日志不能跟着变大
+    const push = (index, field, value, message) => errors.push({ index, field, value: String(value ?? '').slice(0, NAME_MAX_LENGTH), message })
+
+    const rows = (entries === undefined || entries === null) ? [] : entries
+    if (!Array.isArray(rows)) {
+        push(null, 'entries', '', 'entries must be an array')
+        return { raw: '', errors }
+    }
+    if (rows.length > MODEL_MAP_MAX_ROWS) {
+        push(null, 'entries', String(rows.length), `at most ${MODEL_MAP_MAX_ROWS} entries are allowed`)
+        return { raw: '', errors }
+    }
+    if (fallback !== undefined && fallback !== null && typeof fallback !== 'string') {
+        push(null, 'fallback', '', 'fallback must be a string')
+        return { raw: '', errors }
+    }
+
+    const models = Array.isArray(upstreamModels) ? upstreamModels : []
+    let upstreamMissing = false
+    const checkTarget = (index, field, value) => {
+        if (!value) return push(index, field, value, `${field} is empty`)
+        if (value.length > NAME_MAX_LENGTH) return push(index, field, value, `${field} is longer than ${NAME_MAX_LENGTH} characters`)
+        if (RESERVED_TARGET_CHARS.test(value) || CONTROL_CHARS.test(value)) {
+            return push(index, field, value, `${field} must not contain "," "=" or control characters`)
+        }
+        if (models.length === 0) { upstreamMissing = true; return }
+        if (!isKnownUpstreamModel(value, models)) push(index, field, value, `"${value}" is not an upstream model`)
+    }
+
+    const parts = []
+    const seen = new Set()
+    rows.forEach((row, index) => {
+        const alias = stripBracketSuffix(asString(row?.alias)).toLowerCase()
+        const target = asString(row?.target).trim()
+        if (!alias) push(index, 'alias', alias, 'alias is empty')
+        else if (alias.length > NAME_MAX_LENGTH) push(index, 'alias', alias, `alias is longer than ${NAME_MAX_LENGTH} characters`)
+        else if (RESERVED_ALIAS_CHARS.test(alias) || CONTROL_CHARS.test(alias)) push(index, 'alias', alias, 'alias must not contain "," "=" "*" or control characters')
+        else if (seen.has(alias)) push(index, 'alias', alias, `duplicate alias "${alias}"`)
+        if (alias) seen.add(alias)
+        checkTarget(index, 'target', target)
+        parts.push(`${alias}=${target}`)
+    })
+
+    const fb = asString(fallback).trim()
+    if (fb) {
+        checkTarget(null, 'fallback', fb)
+        parts.push(`*=${fb}`)
+    }
+
+    if (upstreamMissing) errors.unshift({ index: null, field: 'upstream', value: '', message: 'upstream model list unavailable; targets cannot be validated' })
+    return { raw: errors.length > 0 ? '' : parts.join(','), errors }
+}
+
 const firstModelByChatType = (models, chatType) => {
     if (!Array.isArray(models)) return null
     const matched = models.find(model => model?.info?.meta?.chat_type?.includes(chatType))
@@ -121,6 +197,27 @@ const recordUnmapped = (name) => {
  * @returns {string[]}
  */
 const getUnmappedModels = () => Array.from(unmappedModels)
+
+/**
+ * 从「待分配」记录里删掉已经分配了映射的名字。记录里存的是原始大小写（只去了 [..] 和控制字符），
+ * 别名是小写的，所以按去 [..] + 小写后比较。
+ * @param {string[]} names - 已保存的别名
+ * @returns {number} 删掉的条数
+ */
+const forgetUnmapped = (names) => {
+    const wanted = new Set((Array.isArray(names) ? names : []).map(name => stripBracketSuffix(name).toLowerCase()).filter(Boolean))
+    if (wanted.size === 0) return 0
+    let removed = 0
+    for (const recorded of unmappedModels) {
+        if (wanted.has(stripBracketSuffix(recorded).toLowerCase())) {
+            unmappedModels.delete(recorded)
+            removed += 1
+        }
+    }
+    // 腾出位置后，再次封顶时要能重新提醒
+    if (removed > 0) capWarned = false
+    return removed
+}
 
 const resetUnmappedModels = () => {
     unmappedModels.clear()
@@ -208,13 +305,16 @@ const mapIncomingModel = async (name) => {
 module.exports = {
     UNMAPPED_CAP,
     NAME_MAX_LENGTH,
+    MODEL_MAP_MAX_ROWS,
     stripBracketSuffix,
     sanitizeName,
     parseModelMap,
     isKnownUpstreamModel,
+    buildModelMap,
     resolveModel,
     recordUnmapped,
     getUnmappedModels,
+    forgetUnmapped,
     resetUnmappedModels,
     resetModelMapState,
     mapIncomingModel

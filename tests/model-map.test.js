@@ -19,13 +19,16 @@ const { logger } = require('../src/utils/logger')
 const {
   UNMAPPED_CAP,
   NAME_MAX_LENGTH,
+  MODEL_MAP_MAX_ROWS,
   stripBracketSuffix,
   sanitizeName,
   parseModelMap,
   isKnownUpstreamModel,
+  buildModelMap,
   resolveModel,
   recordUnmapped,
   getUnmappedModels,
+  forgetUnmapped,
   resetUnmappedModels,
   resetModelMapState,
   mapIncomingModel
@@ -297,6 +300,134 @@ test('a failing model fetch is logged, not swallowed', async () => {
   } finally {
     modelsMapStub.exports.getLatestModels = original
   }
+})
+
+// --- buildModelMap (spec 2: dashboard rows -> MODEL_MAP raw string) ---
+
+test('buildModelMap: valid rows + fallback produce a raw string that parseModelMap round-trips', () => {
+  const { raw, errors } = buildModelMap([
+    { alias: 'claude-opus-5', target: 'qwen3.8-max' },
+    { alias: 'gpt-4o', target: 'qwen3.8-max-thinking' }
+  ], 'qwen3-max', UPSTREAM)
+  assert.deepEqual(errors, [])
+  assert.equal(raw, 'claude-opus-5=qwen3.8-max,gpt-4o=qwen3.8-max-thinking,*=qwen3-max')
+  assert.deepEqual({ ...parseModelMap(raw) }, {
+    'claude-opus-5': 'qwen3.8-max',
+    'gpt-4o': 'qwen3.8-max-thinking',
+    '*': 'qwen3-max'
+  })
+})
+
+test('buildModelMap: alias is trimmed, bracket-stripped and lowercased; target is trimmed and keeps its case', () => {
+  const { raw, errors } = buildModelMap([{ alias: '  Claude-Opus-5 [1m][x] ', target: '  Qwen3.8-Max ' }], '', UPSTREAM)
+  assert.deepEqual(errors, [])
+  assert.equal(raw, 'claude-opus-5=Qwen3.8-Max')
+})
+
+test('buildModelMap: a target that is not an upstream model is reported with its row and nothing is built', () => {
+  const { raw, errors } = buildModelMap([
+    { alias: 'claude-a', target: 'qwen3.8-max' },
+    { alias: 'claude-b', target: 'qwen3.8-max-fast' }
+  ], '', UPSTREAM)
+  assert.equal(raw, '')
+  assert.deepEqual(errors, [{ index: 1, field: 'target', value: 'qwen3.8-max-fast', message: '"qwen3.8-max-fast" is not an upstream model' }])
+  // an unknown fallback is reported under field 'fallback' with index null
+  const fb = buildModelMap([], 'nope-model', UPSTREAM)
+  assert.equal(fb.raw, '')
+  assert.deepEqual(fb.errors, [{ index: null, field: 'fallback', value: 'nope-model', message: '"nope-model" is not an upstream model' }])
+  // an empty target on a row is an error too (the UI select left blank)
+  const blank = buildModelMap([{ alias: 'claude-a', target: '' }], '', UPSTREAM)
+  assert.deepEqual(blank.errors, [{ index: 0, field: 'target', value: '', message: 'target is empty' }])
+})
+
+test('buildModelMap: aliases containing "=", "," or "*" are rejected', () => {
+  for (const alias of ['a=b', 'a,b', '*', 'claude*', 'x\ny']) {
+    const { raw, errors } = buildModelMap([{ alias, target: 'qwen3.8-max' }], '', UPSTREAM)
+    assert.equal(raw, '', alias)
+    assert.equal(errors.length, 1, alias)
+    assert.equal(errors[0].index, 0)
+    assert.equal(errors[0].field, 'alias')
+    assert.match(errors[0].message, /must not contain/)
+  }
+  // an empty alias and an over-long alias are rejected as well
+  assert.match(buildModelMap([{ alias: ' [1m] ', target: 'qwen3.8-max' }], '', UPSTREAM).errors[0].message, /alias is empty/)
+  const long = buildModelMap([{ alias: 'a'.repeat(NAME_MAX_LENGTH + 1), target: 'qwen3.8-max' }], '', UPSTREAM)
+  assert.match(long.errors[0].message, /longer than 200/)
+  assert.equal(long.errors[0].value.length, NAME_MAX_LENGTH, 'the echoed value is bounded')
+  assert.equal(buildModelMap([{ alias: 'a'.repeat(NAME_MAX_LENGTH), target: 'qwen3.8-max' }], '', UPSTREAM).errors.length, 0)
+  // a target carrying a separator can never round-trip
+  assert.match(buildModelMap([{ alias: 'a', target: 'qwen3.8-max,x' }], '', UPSTREAM).errors[0].message, /must not contain/)
+})
+
+test('buildModelMap: duplicate alias after case and bracket normalization is rejected once per extra row', () => {
+  const { raw, errors } = buildModelMap([
+    { alias: 'claude-opus-5', target: 'qwen3.8-max' },
+    { alias: 'Claude-Opus-5[1m]', target: 'qwen3-max' },
+    { alias: 'CLAUDE-OPUS-5', target: 'qwen3-max' }
+  ], '', UPSTREAM)
+  assert.equal(raw, '')
+  assert.deepEqual(errors.map(e => [e.index, e.field, e.message]), [
+    [1, 'alias', 'duplicate alias "claude-opus-5"'],
+    [2, 'alias', 'duplicate alias "claude-opus-5"']
+  ])
+})
+
+test('buildModelMap: fallback only, and empty input clears the map', () => {
+  assert.deepEqual(buildModelMap([], 'qwen3.8-max-thinking', UPSTREAM), { raw: '*=qwen3.8-max-thinking', errors: [] })
+  assert.deepEqual(buildModelMap([], '', UPSTREAM), { raw: '', errors: [] })
+  assert.deepEqual(buildModelMap([], '   ', UPSTREAM), { raw: '', errors: [] })
+  assert.deepEqual(buildModelMap(undefined, undefined, UPSTREAM), { raw: '', errors: [] })
+  assert.deepEqual(buildModelMap(null, null, UPSTREAM), { raw: '', errors: [] })
+  // clearing needs no upstream list
+  assert.deepEqual(buildModelMap([], '', []), { raw: '', errors: [] })
+})
+
+test('buildModelMap: with no upstream list targets cannot be validated -> one upstream error, aliases still checked', () => {
+  const { raw, errors } = buildModelMap([{ alias: 'claude-a', target: 'qwen3.8-max' }, { alias: 'a=b', target: 'x' }], 'qwen3-max', [])
+  assert.equal(raw, '')
+  assert.equal(errors[0].field, 'upstream')
+  assert.match(errors[0].message, /upstream model list unavailable/)
+  assert.deepEqual(errors.slice(1).map(e => [e.index, e.field]), [[1, 'alias']])
+  assert.equal(buildModelMap([{ alias: 'claude-a', target: 'qwen3.8-max' }], '', undefined).errors[0].field, 'upstream')
+})
+
+test('buildModelMap: malformed input is an error, never a throw', () => {
+  assert.deepEqual(buildModelMap('claude-a=qwen3.8-max', '', UPSTREAM).errors, [{ index: null, field: 'entries', value: '', message: 'entries must be an array' }])
+  assert.deepEqual(buildModelMap([], { x: 1 }, UPSTREAM).errors, [{ index: null, field: 'fallback', value: '', message: 'fallback must be a string' }])
+  assert.deepEqual(buildModelMap({ alias: 'a', target: 'b' }, '', UPSTREAM).errors[0].field, 'entries')
+  // rows that are not objects or carry non-string fields are reported per row, not thrown
+  const { errors } = buildModelMap([null, 42, { alias: 7, target: ['qwen3.8-max'] }, { alias: 'ok', target: 'qwen3.8-max' }], 123, UPSTREAM)
+  assert.deepEqual(errors.map(e => [e.index, e.field]), [[null, 'fallback']])
+  const rows = buildModelMap([null, 42, { alias: 7, target: ['qwen3.8-max'] }, { alias: 'ok', target: 'qwen3.8-max' }], '', UPSTREAM)
+  assert.deepEqual(rows.errors.map(e => [e.index, e.field]), [[0, 'alias'], [0, 'target'], [1, 'alias'], [1, 'target'], [2, 'alias'], [2, 'target']])
+})
+
+test('buildModelMap: row count and target length are capped; every echoed value is bounded', () => {
+  const rows = Array.from({ length: MODEL_MAP_MAX_ROWS + 1 }, (_, i) => ({ alias: `a${i}`, target: 'qwen3.8-max' }))
+  const capped = buildModelMap(rows, '', UPSTREAM)
+  assert.equal(capped.raw, '')
+  assert.deepEqual(capped.errors, [{ index: null, field: 'entries', value: '201', message: 'at most 200 entries are allowed' }])
+  assert.equal(buildModelMap(rows.slice(0, MODEL_MAP_MAX_ROWS), '', UPSTREAM).errors.length, 0)
+  const longTarget = 'q'.repeat(NAME_MAX_LENGTH + 1)
+  const long = buildModelMap([{ alias: 'a', target: longTarget }], longTarget, UPSTREAM)
+  assert.deepEqual(long.errors.map(e => [e.index, e.field, e.message, e.value.length]), [
+    [0, 'target', 'target is longer than 200 characters', NAME_MAX_LENGTH],
+    [null, 'fallback', 'fallback is longer than 200 characters', NAME_MAX_LENGTH]
+  ])
+  assert.equal(buildModelMap([{ alias: 'a', target: 'q'.repeat(NAME_MAX_LENGTH) }], '', UPSTREAM).errors[0].message, `"${'q'.repeat(NAME_MAX_LENGTH)}" is not an upstream model`)
+})
+
+test('forgetUnmapped drops saved aliases from the record, case- and bracket-insensitively', () => {
+  resetModelMapState()
+  assert.equal(recordUnmapped('Claude-Opus-5'), true)
+  assert.equal(recordUnmapped('gpt-4o'), true)
+  assert.equal(recordUnmapped('keep-me'), true)
+  assert.equal(forgetUnmapped(['claude-opus-5', 'GPT-4o[1m]', 'never-seen']), 2)
+  assert.deepEqual(getUnmappedModels(), ['keep-me'])
+  assert.equal(forgetUnmapped([]), 0)
+  assert.equal(forgetUnmapped(undefined), 0)
+  assert.equal(forgetUnmapped(['*', '']), 0)
+  resetModelMapState()
 })
 
 test('the resolver never loads account.js', () => {

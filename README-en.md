@@ -130,7 +130,7 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | `OUTPUT_THINK` | Whether to show AI thinking process | `true` or `false` |
 | `LEGACY_REASONING_IN_CONTENT` | Reasoning output format. Default `false` = reasoning goes to a separate `reasoning_content` field; `true` = legacy behavior (`<think>` inside `content`) | `true` or `false` |
 | `SIMPLE_MODEL_MAP` | Simplify model mapping, return basic models without variants only | `true` or `false` |
-| `MODEL_MAP` | Incoming model name mapping: `alias=qwen-id,...,*=fallback`. Exact entry wins (trailing `[..]` stripped, case-insensitive), existing Qwen ids pass through, everything else uses `*`; applies to `/v1/chat/completions` and `/v1/messages` only, see `.env.example` | `*=qwen3.8-max-thinking` |
+| `MODEL_MAP` | Incoming model name mapping: `alias=qwen-id,...,*=fallback`. Exact entry wins (trailing `[..]` stripped, case-insensitive), existing Qwen ids pass through, everything else uses `*`; applies to `/v1/chat/completions` and `/v1/messages` only. Also editable at runtime in the dashboard (Settings → Model mapping); a dashboard-saved map overrides this variable, see `.env.example` | `*=qwen3.8-max-thinking` |
 | `MODELS_CACHE_TTL` | Model list cache TTL in seconds; after expiry the next request refreshes it from upstream; `0` = never expires | `3600` |
 | `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` | Externalize complete Agent tool definitions and history as a Qwen text document when the request body exceeds this size, avoiding the roughly 128 KiB WAF limit | `92160` (90 KiB) |
 | `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | Maximum size of the tool protocol and current turn kept in the live request after context externalization | `49152` (48 KiB) |
